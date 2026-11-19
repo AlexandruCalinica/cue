@@ -108,6 +108,13 @@ npm run lint && npm run build && npm test
 
 Node ≥ 22.13 (for `node:sqlite`).
 
+CI: the workflow lives at [`docs/ci.yml`](docs/ci.yml) for now; move it to
+`.github/workflows/ci.yml` to enable it (pushing workflow files needs a token with the `workflow` scope).
+
+journal: this repo uses [djournal](https://www.npmjs.com/package/djournal) (`.agents/`, `AGENTS.md`). Its
+machine-local files (`.djournal.json`, `.journal/`, `.claude/settings.json`) are gitignored; recreate them with
+`journal install --target . --harness claude-code,codex,grok-bot --yes`.
+
 ## Milestones
 
 - **M0 – scaffold** (this): packages, types, schema, design, CI.
