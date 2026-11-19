@@ -1,0 +1,9 @@
+{
+  "name": "@cue/store",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "license": "ISC",
+  "exports": { ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" } },
+  "dependencies": { "@cue/core": "0.0.0" }
+}

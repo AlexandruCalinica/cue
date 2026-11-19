@@ -1,0 +1,23 @@
+{
+  "name": "@cue/daemon",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "license": "ISC",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "dependencies": {
+    "@cue/core": "0.0.0",
+    "@cue/store": "0.0.0",
+    "@cue/harness": "0.0.0",
+    "@cue/router": "0.0.0",
+    "libeam": "0.3.0"
+  },
+  "bin": {
+    "cued": "./dist/cued.js"
+  }
+}

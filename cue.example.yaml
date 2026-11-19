@@ -1,0 +1,53 @@
+# cue.example.yaml: every key is optional except `pools`.
+dataDir: .cue-data
+
+node:
+  id: cued
+  port: 47100            # libeam: rpc=47100, pub=47101, gossip(udp)=47102
+  bindAddress: 127.0.0.1
+  gossipIntervalMs: 200
+
+limits:
+  defaultMaxMinutes: 60
+  maxMaxMinutes: 240
+  leaseTtlSec: 30
+  maxAttempts: 3
+
+isolation:
+  kind: systemd-scope    # or: process-group
+  memoryMax: 4G
+  cpuQuota: 200%
+  tasksMax: 512
+
+pools:
+  - harness: claude
+    account: work
+    concurrency: 2
+    rate: { jobs: 20, windowSec: 3600 }
+  - harness: codex
+    concurrency: 1
+
+lanes:
+  team-a: { concurrency: 1 }
+
+routing:
+  - name: investigations-prefer-codex
+    match: { labels: [investigate] }
+    use: [codex, claude]
+  - name: everything-else
+    use: [claude:work]
+
+hooks:
+  preRun:
+    - run: [./hooks/prepare-workspace]   # e.g. create a git worktree, print {"workdir": "..."}
+      timeoutSec: 300
+  postRun:
+    - run: [./hooks/publish-changes]     # e.g. push a branch, open a draft PR
+  onComplete:
+    - run: [./hooks/record]
+      required: false
+
+notify:
+  - kind: webhook
+    url: https://example.com/cue-events
+    on: [terminal, denial]
