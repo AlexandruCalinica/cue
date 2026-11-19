@@ -3,3 +3,9 @@ dist
 *.tsbuildinfo
 .cue-data
 coverage
+
+# djournal: machine-local install state (holds this machine's absolute store path).
+# Run `journal install --target . --harness claude-code,codex,grok-bot --yes` after cloning.
+.djournal.json
+.journal/
+.claude/settings.json
