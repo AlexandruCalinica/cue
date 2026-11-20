@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { JobSpecSchema, parseJobId, type JobId, type JobResult, type JobSpecInput } from "@cue/core";
-import { openSqliteStore, StaleLeaseError, type Store } from "@cue/store";
+import { openSqliteStore, SQLITE_SCHEMA, StaleLeaseError, type Store } from "@cue/store";
 
 let seq = 0;
 const id = (): JobId => parseJobId(`job-20261120-${(++seq).toString(16).padStart(6, "0")}`);
@@ -170,6 +170,20 @@ function storeContract(name: string, open: () => Store) {
       expect(s.listJobs({ limit: 1 }).map((r) => r.id)).toEqual([c]);
     });
 
+    it("lists a node's active leases and keeps fenced runtime data per attempt", () => {
+      const j = id();
+      s.insertJob({ id: j, spec: spec(), candidates: ["claude:a"] });
+      const l = must(lease(s));
+      expect(s.activeLeases("node-1")).toEqual([{ ...l, pool: "claude:a" }]);
+      expect(s.activeLeases("node-2")).toEqual([]);
+      s.setRuntime({ lease: l, runtime: { pgid: 42, offset: 10 } });
+      expect(s.getRuntime(j)).toEqual({ pgid: 42, offset: 10 });
+      expect(() => s.setRuntime({ lease: { ...l, fence: 99 }, runtime: {} })).toThrow(StaleLeaseError);
+      s.requeue({ lease: l });
+      expect(s.getRuntime(j)).toBeNull();
+      expect(s.activeLeases("node-1")).toEqual([]);
+    });
+
     it("appends and pages events per job", () => {
       const j = id();
       const k = id();
@@ -212,6 +226,21 @@ describe("sqlite file store", () => {
     const c = openSqliteStore(path);
     expect(c.getJob(j)?.status).toBe("leased");
     c.close();
+  });
+
+  it("migrates a v1 database by adding the runtime column", async () => {
+    const path = join(dir, "v1.db");
+    const { DatabaseSync } = await import("node:sqlite");
+    const raw = new DatabaseSync(path);
+    raw.exec(SQLITE_SCHEMA.replace(",\n  runtime TEXT", ""));
+    raw.exec("PRAGMA user_version = 1");
+    raw.close();
+    const st = openSqliteStore(path);
+    const j = id();
+    st.insertJob({ id: j, spec: spec(), candidates: ["claude:a"] });
+    st.setRuntime({ lease: must(lease(st)), runtime: { ok: true } });
+    expect(st.getRuntime(j)).toEqual({ ok: true });
+    st.close();
   });
 
   it("refuses a database from a newer schema", async () => {

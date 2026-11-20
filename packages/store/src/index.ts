@@ -95,6 +95,14 @@ export interface Store {
   requestCancel(id: JobId): JobRecord | null;
   /** Expired leases, for recovery at boot and on every scheduler tick. */
   expiredLeases(now: number): readonly Lease[];
+  /** Live (leased or running) leases held by `owner`, so a restarted node can adopt its jobs. */
+  activeLeases(owner: string): readonly (Lease & { readonly pool: string })[];
+  /**
+   * Holder-private runtime data for the current attempt (process handle,
+   * output offset, ...), kept so a restarted holder can reattach. Fenced.
+   */
+  setRuntime(input: { lease: Lease; runtime: unknown }): void;
+  getRuntime(id: JobId): unknown;
   /**
    * Atomically requeues every job whose lease expired before `now`, fencing
    * out the old holders, and returns the leases it revoked. Jobs flagged for
@@ -106,7 +114,7 @@ export interface Store {
   close(): void;
 }
 
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 2;
 
 /** Schema of the SQLite store (version {@link SCHEMA_VERSION}). */
 export const SQLITE_SCHEMA = `
@@ -126,7 +134,8 @@ CREATE TABLE IF NOT EXISTS jobs (
   created_at TEXT NOT NULL,
   started_at TEXT,
   finished_at TEXT,
-  result TEXT
+  result TEXT,
+  runtime TEXT
 );
 CREATE INDEX IF NOT EXISTS jobs_queue ON jobs (status, priority, created_at);
 CREATE INDEX IF NOT EXISTS jobs_lease ON jobs (lease_expires) WHERE lease_owner IS NOT NULL;
@@ -168,10 +177,12 @@ const JobRowSchema = z.object({
   started_at: z.string().nullable(),
   finished_at: z.string().nullable(),
   result: json(JobResultSchema).nullable(),
+  runtime: json(z.unknown()).nullable(),
 });
 type JobRow = z.infer<typeof JobRowSchema>;
 
 const LeaseRowSchema = JobRowSchema.pick({ id: true, lease_owner: true, fence: true, lease_expires: true });
+const PoolLeaseRowSchema = LeaseRowSchema.extend({ pool: z.string() });
 const EventRowSchema = z.object({
   seq: z.number(),
   job_id: JobIdSchema,
@@ -233,7 +244,8 @@ function migrate(db: DatabaseSync): void {
   }
   if (version < SCHEMA_VERSION) {
     tx(db, () => {
-      db.exec(SQLITE_SCHEMA);
+      if (version === 0) db.exec(SQLITE_SCHEMA);
+      if (version === 1) db.exec("ALTER TABLE jobs ADD COLUMN runtime TEXT");
       db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
     });
   }
@@ -331,7 +343,7 @@ class SqliteStore implements Store {
       const expires = input.now + input.ttlMs;
       this.run(
         `UPDATE jobs SET status = 'leased', pool = ?, phase = NULL, fence = fence + 1, attempt = attempt + 1,
-           lease_owner = ?, lease_expires = ? WHERE id = ?`,
+           lease_owner = ?, lease_expires = ?, runtime = NULL WHERE id = ?`,
         input.pool,
         input.owner,
         expires,
@@ -372,7 +384,7 @@ class SqliteStore implements Store {
     this.fenced(
       input.lease,
       `status = 'queued', phase = NULL, pool = NULL, fence = fence + 1, lease_owner = NULL, lease_expires = NULL,
-       attempt = attempt - ?`,
+       runtime = NULL, attempt = attempt - ?`,
       input.refundAttempt ? 1 : 0,
     );
   }
@@ -417,6 +429,24 @@ class SqliteStore implements Store {
       .prepare(`SELECT id, lease_owner, fence, lease_expires FROM jobs WHERE ${ACTIVE} AND lease_expires < ?`)
       .all(now)
       .map((row) => toLease(LeaseRowSchema.parse(row)));
+  }
+
+  activeLeases(owner: string): readonly (Lease & { readonly pool: string })[] {
+    return this.db
+      .prepare(`SELECT id, lease_owner, fence, lease_expires, pool FROM jobs WHERE ${ACTIVE} AND lease_owner = ? AND pool IS NOT NULL`)
+      .all(owner)
+      .map((raw) => {
+        const row = PoolLeaseRowSchema.parse(raw);
+        return { ...toLease(row), pool: row.pool };
+      });
+  }
+
+  setRuntime(input: { lease: Lease; runtime: unknown }): void {
+    this.fenced(input.lease, "runtime = ?", JSON.stringify(input.runtime ?? null));
+  }
+
+  getRuntime(id: JobId): unknown {
+    return this.job(id)?.runtime ?? null;
   }
 
   reclaimExpired(now: number): readonly Lease[] {

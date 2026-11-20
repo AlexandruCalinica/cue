@@ -1,16 +1,18 @@
-import type { JobId, JobRecordView, JobSpecInput } from "./types.js";
+import type { ActorRefFrom } from "libeam";
+import type { Gateway } from "./actors/gateway.js";
 
 /** Registered name of the Gateway actor that client nodes look up. */
 export const GATEWAY_NAME = "cue.gateway";
 
-/** Calls a client node may make on the Gateway (`ref.call({ method, args })`). */
-export interface GatewayCalls {
-  ping(): "pong";
-  submit(spec: JobSpecInput): { id: JobId };
-  status(id: JobId): JobRecordView | null;
-  list(query: { limit?: number; status?: string[] }): JobRecordView[];
-  cancel(id: JobId): { id: JobId; accepted: boolean };
-  logs(query: { id: JobId; lines?: number }): string[];
-}
+/**
+ * Typed reference to the Gateway: `ref.call("submit", spec)`, `ref.call("status", id)`,
+ * `ref.call("list", { limit })`, `ref.call("cancel", id)`, `ref.call("logs", { id, lines })`,
+ * `ref.call("events", { id, afterSeq })`, `ref.call("ping")`.
+ */
+export type GatewayRef = ActorRefFrom<typeof Gateway>;
 
-export type GatewayMethod = keyof GatewayCalls;
+declare module "libeam" {
+  interface ActorRegistry {
+    "cue.gateway": typeof Gateway;
+  }
+}
