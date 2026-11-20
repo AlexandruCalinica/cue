@@ -5,7 +5,8 @@ dist
 coverage
 
 # djournal: machine-local install state (holds this machine's absolute store path).
+# The shared projection under .journal/work/ IS committed.
 # Run `journal install --target . --harness claude-code,codex,grok-bot --yes` after cloning.
 .djournal.json
-.journal/
+.journal/.install/
 .claude/settings.json
