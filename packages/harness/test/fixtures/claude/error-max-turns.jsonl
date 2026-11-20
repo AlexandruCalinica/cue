@@ -1,0 +1,3 @@
+{"type":"system","subtype":"init","cwd":"/work","session_id":"00000000-0000-4000-8000-000000000011","tools":["Bash","Read"],"model":"claude-haiku-5-5","permissionMode":"default","claude_code_version":"2.1.329","uuid":"00000000-0000-4000-8000-000000000012"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Read","input":{"file_path":"/work/a"}}]},"session_id":"00000000-0000-4000-8000-000000000011"}
+{"type":"result","subtype":"error_max_turns","is_error":true,"duration_ms":5000,"num_turns":1,"stop_reason":null,"session_id":"00000000-0000-4000-8000-000000000011","total_cost_usd":0.01,"permission_denials":[],"terminal_reason":"max_turns","uuid":"00000000-0000-4000-8000-000000000013"}
