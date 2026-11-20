@@ -12,6 +12,7 @@
   },
   "dependencies": {
     "@cue/core": "0.0.0",
+    "zod": "^4.1.12",
     "@cue/store": "0.0.0",
     "@cue/harness": "0.0.0",
     "@cue/router": "0.0.0",
