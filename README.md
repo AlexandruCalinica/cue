@@ -5,8 +5,10 @@ harness (Claude Code, Codex CLI, Cursor agent, ...) and account by rules, runs i
 isolated process tree, and records every state change in SQLite. Built on
 [libeam](https://github.com/AlexandruCalinica/libeam), an Erlang/OTP-style actor system for TypeScript.
 
-> **Status: scaffold.** Packages, types, config schema and design are in place; the daemon,
-> store and client are stubs (`NotImplementedError`). See [Milestones](#milestones).
+> **Status: M1 (single node) done.** `cued` runs Claude Code jobs end to end on one host: SQLite
+> store with fenced leases, hooks, cancel/timeout, rate-limit requeue, restart re-attach, and the
+> `cue` client over libeam. Lanes, notifications and further harnesses are later milestones; see
+> [Milestones](#milestones).
 
 cue is deliberately generic: it knows nothing about any company's repos, ticket system or
 release flow. Anything org-specific plugs in through [hooks](#extension-model-hooks-and-plugins).
@@ -16,55 +18,57 @@ release flow. Anything org-specific plugs in through [hooks](#extension-model-ho
 | Package | What it holds |
 |---|---|
 | `@cue/core` | Job spec + id types, statuses and phases, the `cue.yaml` schema (zod) |
-| `@cue/store` | `Store` port (jobs, fenced leases, write-ahead phases, events) and the SQLite schema |
+| `@cue/store` | `Store` port (jobs, fenced leases, write-ahead phases, events) and its SQLite implementation |
 | `@cue/harness` | `HarnessAdapter` interface, normalised `HarnessEvent`s, the Claude Code adapter |
 | `@cue/router` | Pure routing (`route(spec, config)`) and quota/rate-limit state |
-| `@cue/daemon` | `cued`: supervision tree, Gateway protocol, hook and process contracts |
+| `@cue/daemon` | `cued`: Gateway, Scheduler and JobActors, process controller, script hook runner; `@cue/daemon/protocol` for clients |
 | `@cue/cli` | `cue`: the client, itself a short-lived libeam node |
 
 ## Design
 
 ```
- cue (client node) ──libeam call──▶ Gateway ──▶ SQLite (source of truth)
-                                       │ poke
+ cue (client node) ──libeam call──▶ Gateway ──▶ SQLite (source of truth: jobs, leases, phases, events)
+                                       │ poke                 ▲
+                                       ▼                      │ fenced writes
+                                   Scheduler ── leaseNext per pool (concurrency + rate quota)
+                                       │ spawn + watch
                                        ▼
-                                  QueueProducer ◀── QuotaActor (per account)
-                                       │ lease (fenced)
-                         ┌─────────────┼─────────────┐
-                         ▼             ▼             ▼
-                HarnessPool claude:a   codex:default  ...      (DynamicSupervisor, maxChildren = concurrency)
-                         │
-                      JobActor  prepare → run → post → finalize   (phase written before side effects)
-                         │
-                    ProcessActor  systemd-run --user --scope … (or process group); output → file, tailed
-                         │
-                      Notifier  webhooks / commands on job events
+                                   JobActor   prepare → run → post → finalize   (phase written before side effects)
+                                       │
+                          ProcessController   systemd-run --user --scope … or a process group;
+                                              stdout → file, tailed through the harness adapter
 ```
 
-- **Gateway** (registered as `cue.gateway`) validates a submitted spec, asks the router for
-  ordered candidate pools, writes the job and pokes the producer. It serves
-  `submit / status / list / cancel / logs`.
+- **Gateway** (registered as `cue.gateway`) validates a submitted spec, caps `maxMinutes`, asks
+  the router for ordered candidate pools, writes the job and pokes the scheduler. It serves
+  `ping / submit / status / list / cancel / logs / events / stats`.
 - **Router** is a pure function over `cue.yaml` rules: the first rule whose `match`
   (labels, requester, lane) fits yields an ordered list of pools or harnesses; a job may pin
   `harness: claude` or `harness: claude:work`.
-- **QueueProducer** owns demand: for each pool with free slots, lane room and quota, it takes
-  the best queued job whose candidates include that pool (`leaseNext`) and starts a
-  JobActor under the pool. Rate-limited jobs go back to the queue without using an attempt.
-- **QuotaActor** (one per account) keeps a start budget (`rate: {jobs, windowSec}`) and pauses
-  the account until the reset time a harness reports, or a default backoff.
-- **JobActor** runs one attempt through `prepare` (preRun hooks), `run` (harness), `post`
-  (postRun hooks) and `finalize` (result, onComplete hooks, notifications). Each phase is
-  written to the store *before* its side effects, so a restarted actor resumes from the
-  recorded phase instead of re-running finished work. It renews its lease while it runs.
-- **ProcessActor** starts the harness through `systemd-run --user --scope` (cgroup memory/CPU/
-  task limits, whole-tree kill via `systemctl --user stop`) or a plain process group. stdout and
-  stderr go to files, never pipes, so a daemon restart doesn't kill the harness. The actor tails the
-  file, turns lines into events through the adapter, and kills the tree on cancel or timeout.
-- **Store** is SQLite (`node:sqlite`, WAL). Leases carry a monotonically increasing
-  `fence`; every write by a lease holder presents it, and stale holders are rejected. At boot,
-  expired or orphaned leases are re-leased and their JobActors respawned at their phase.
-- **Notifier** sends events (terminal states, permission denials, empty results) to webhooks or
-  commands. Denials are first-class: a run that "succeeded" with denials is flagged, not silent.
+- **Scheduler** runs on every tick and every poke. It reclaims expired leases (their old holders
+  are fenced out), then for each pool with free slots and quota takes the best queued job whose
+  candidates include that pool (`leaseNext`: lowest priority, then oldest) and starts a JobActor
+  for it. It keeps each account's start budget (`rate: {jobs, windowSec}`) and pauses the account
+  until the reset time a harness reports (or a 15-minute default). At boot it adopts the leases
+  this node (`node.id`) still holds and restarts their JobActors.
+- **JobActor** runs one attempt through `prepare` (job dir, `job.json`, preRun hooks), `run`
+  (harness), `post` (postRun hooks) and `finalize` (`result.json`, onComplete hooks, finish).
+  Each phase is written to the store *before* its side effects and per-attempt state (process
+  handle, output offset, parsed outcome) is kept in the store, so a restarted actor resumes
+  instead of redoing work. Hooks run off the actor's mailbox, so it keeps renewing its lease and
+  noticing cancel requests while they run. Cancel and timeout send SIGTERM to the process group,
+  then SIGKILL after a grace period. A rate-limited run goes back to the queue without using an
+  attempt; after `maxAttempts` a job fails.
+- **ProcessController** starts the harness through `systemd-run --user --scope` (cgroup
+  memory/CPU/task limits, whole-tree kill via `systemctl --user stop`) or a plain process group.
+  stdout and stderr go to files, never pipes, and the exit code is written atomically, so
+  stopping `cued` doesn't stop running harnesses and a restarted `cued` re-attaches to them.
+- **Store** is SQLite (`node:sqlite`, WAL, versioned schema). Leases carry a monotonically
+  increasing `fence`; every write by a lease holder presents it, and stale holders get
+  `StaleLeaseError`. The `Store` interface has contract tests any other backend must pass.
+- **Results are honest**: a run that "succeeded" with permission denials is flagged
+  `permission-denied`, a harness that exits without a result line fails, and unparseable output
+  is flagged rather than ignored.
 
 ### Harness adapters
 
@@ -97,7 +101,28 @@ later option; scripts come first because they work with any language and any org
 ## Configuration
 
 See [`cue.example.yaml`](cue.example.yaml); the schema and its types live in
-`packages/core/src/config.ts`.
+`packages/core/src/config.ts`. Not yet acted on in M1: `lanes` and `notify` (M3), and pools for
+harnesses without an adapter (only `claude` ships today; `cued` refuses to start with others).
+
+## Running
+
+```sh
+npm install && npm run build
+export CUE_COOKIE="$(openssl rand -hex 24)"      # shared by cued and every client
+node packages/daemon/dist/cued.js cue.yaml        # prints the CUE_SEEDS value to use
+
+export CUE_SEEDS=127.0.0.1:47102                  # daemon node.port + 2 (gossip)
+echo '{"prompt": "Fix the flaky test in src/foo.test.ts", "workdir": "/srv/repo"}' \
+  | node packages/cli/dist/cue.js submit           # prints the job id
+node packages/cli/dist/cue.js status <id>
+node packages/cli/dist/cue.js logs <id> -n 50
+node packages/cli/dist/cue.js cancel <id>
+```
+
+Each job gets `<dataDir>/jobs/<id>/` with `job.json`, the harness `stdout`/`stderr`, `exit-code`
+and `result.json`. Without a `workdir` (from the spec or a preRun hook) the harness runs in that
+job directory. Stopping `cued` (SIGTERM) leaves running harnesses alone; start it again with the
+same `node.id` and `dataDir` and it picks them up.
 
 ## Development
 
@@ -117,9 +142,10 @@ machine-local files (`.djournal.json`, `.journal/`, `.claude/settings.json`) are
 
 ## Milestones
 
-- **M0 – scaffold** (this): packages, types, schema, design, CI.
-- **M1 – single node**: SQLite store, Gateway, QueueProducer, pools, JobActor, ProcessActor,
-  hook runner, Claude adapter parsing (fixture-backed), `cue` client; end-to-end tests with a fake harness.
+- **M0 – scaffold** (done): packages, types, schema, design, CI.
+- **M1 – single node** (done): SQLite store, Gateway, Scheduler, JobActor, process controller,
+  hook runner, Claude adapter parsing (fixture-backed), `cue` client; end-to-end tests with a fake
+  harness and with the real `cued`/`cue` binaries.
 - **M2 – migration shim**: bridge or import jobs from an existing flat-file, single-harness queue,
   with compatibility hooks, so existing users can move over without changing clients.
 - **M3 – routing and more harnesses**: Codex and Cursor adapters, rule-based routing across them,
@@ -135,9 +161,13 @@ cue uses libeam as a primitives-only dependency. Things to know (as of libeam 0.
 - `ZeroMQTransport` derives a peer's pub port as `rpcPort + 1`, so cue always uses the single
   `port` convention (rpc = p, pub = p+1, gossip = p+2) rather than custom `ports`.
 - GenStage `Producer` emits only from `handleDemand`, so a database-backed queue can't push
-  newly submitted jobs into pending demand. cue's QueueProducer therefore tracks demand itself
-  and uses `DynamicSupervisor` (with `maxChildren`) for pools.
-- `system.getActorByName()` returns an untyped `ActorRef`; call it as `ref.call({ method, args })`.
+  newly submitted jobs into pending demand. cue's Scheduler therefore polls the store on ticks and
+  pokes and enforces pool concurrency itself.
+- `system.getActorByName()` returns an untyped `ActorRef` even with `ActorRegistry` augmentation;
+  `ref.call("submit", spec)` would treat `spec` as the timeout. Use `gatewayClient(ref)` from
+  `@cue/daemon/protocol`, which always sends `{ method, args }`.
+- Actor handlers run one at a time and are awaited, so slow work (hooks) runs off the mailbox and
+  reports back with a cast.
 
 ## License
 
