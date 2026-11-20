@@ -120,9 +120,12 @@ machine-local files (`.djournal.json`, `.journal/`, `.claude/settings.json`) are
 - **M0 – scaffold** (this): packages, types, schema, design, CI.
 - **M1 – single node**: SQLite store, Gateway, QueueProducer, pools, JobActor, ProcessActor,
   hook runner, Claude adapter parsing (fixture-backed), `cue` client; end-to-end tests with a fake harness.
-- **M2 – more harnesses**: Codex and Cursor adapters; routing across them.
-- **M3 – quota and notifications**: rate-limit handling, budgets, webhooks.
-- **M4 – identity**: per-client Ed25519 keys, verbs and lanes per client.
+- **M2 – migration shim**: bridge or import jobs from an existing flat-file, single-harness queue,
+  with compatibility hooks, so existing users can move over without changing clients.
+- **M3 – routing and more harnesses**: Codex and Cursor adapters, rule-based routing across them,
+  quotas, budgets, rate-limit pauses, notifications.
+- **M4 – identity and safety**: per-client Ed25519 keys, verbs and lanes per client, audit events,
+  permission-denial detection.
 - **M5 – multiple hosts**: runner nodes with libeam roles; store-backed leases across nodes.
 
 ## libeam notes
