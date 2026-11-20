@@ -52,10 +52,10 @@ describe("cued end to end (fake harness)", () => {
   };
 
   const submit = async (prompt: string, over: Partial<JobSpecInput> = {}): Promise<JobId> =>
-    (await gw().call("submit", { prompt, requester: "tester", ...over })).id;
+    (await gw().submit({ prompt, requester: "tester", ...over })).id;
 
   const status = async (id: JobId): Promise<JobRecordView> => {
-    const rec = await gw().call("status", id);
+    const rec = await gw().status(id);
     if (!rec) throw new Error(`no job ${id}`);
     return rec;
   };
@@ -66,7 +66,7 @@ describe("cued end to end (fake harness)", () => {
       return isTerminal(rec.status) ? rec : undefined;
     }, timeoutMs, `job ${id} to finish`);
 
-  const eventTypes = async (id: JobId) => (await gw().call("events", { id })).map((e) => e.type);
+  const eventTypes = async (id: JobId) => (await gw().events({ id })).map((e) => e.type);
 
   beforeEach(() => {
     dir = mkdtempSync(join(tmpdir(), "cue-e2e-"));
@@ -79,23 +79,23 @@ describe("cued end to end (fake harness)", () => {
 
   it("runs a job to success and records result, events, logs and result.json", async () => {
     await start();
-    expect(await gw().call("ping")).toBe("pong");
+    expect(await gw().ping()).toBe("pong");
     const id = await submit("say hello world");
     const rec = await settle(id);
     expect(rec).toMatchObject({ status: "succeeded", attempt: 1, pool: "claude:a", phase: "done" });
     expect(rec.result).toMatchObject({ report: "hello world", exitCode: 0, costUsd: 0.02, numTurns: 1, permissionDenials: 0, flags: [] });
     expect(rec.result?.sessionId).toMatch(/^fake-/);
     expect(await eventTypes(id)).toEqual(expect.arrayContaining(["submitted", "leased", "started", "session", "message", "result", "finished"]));
-    expect((await gw().call("logs", { id, lines: 1 }))[0]).toContain('"type":"result"');
+    expect((await gw().logs({ id, lines: 1 }))[0]).toContain('"type":"result"');
     const onDisk = JSON.parse(readFileSync(join(dir, "data", "jobs", id, "result.json"), "utf8"));
     expect(onDisk.status).toBe("succeeded");
   });
 
   it("rejects invalid specs and unroutable jobs", async () => {
     await start();
-    await expect(gw().call("submit", { prompt: "" })).rejects.toThrow(/invalid job spec/);
-    await expect(gw().call("submit", { prompt: "x", requester: "t", harness: "codex" })).rejects.toThrow(/no enabled pool/);
-    await expect(gw().call("status", "nope")).rejects.toThrow(/invalid job id/);
+    await expect(gw().submit({ prompt: "" })).rejects.toThrow(/invalid job spec/);
+    await expect(gw().submit({ prompt: "x", requester: "t", harness: "codex" })).rejects.toThrow(/no enabled pool/);
+    await expect(gw().status("nope")).rejects.toThrow(/invalid job id/);
   });
 
   it("reports a failing harness as failed with its error", async () => {
@@ -122,17 +122,17 @@ describe("cued end to end (fake harness)", () => {
     await waitFor(async () => ((await status(running)).status === "running" ? true : undefined), 5000, "running");
     expect((await status(queued)).status).toBe("queued");
 
-    expect(await gw().call("cancel", queued)).toMatchObject({ accepted: true, status: "cancelled" });
-    const c = await gw().call("cancel", running);
+    expect(await gw().cancel(queued)).toMatchObject({ accepted: true, status: "cancelled" });
+    const c = await gw().cancel(running);
     expect(c.accepted).toBe(true);
     const rec = await settle(running);
     expect(rec.status).toBe("cancelled");
-    const started = (await gw().call("events", { id: running })).find((e) => e.type === "started");
+    const started = (await gw().events({ id: running })).find((e) => e.type === "started");
     const data: unknown = started?.data;
     const pgid = typeof data === "object" && data !== null && "pgid" in data ? Number(data.pgid) : Number.NaN;
     expect(Number.isInteger(pgid)).toBe(true);
     expect(pidAlive(pgid)).toBe(false);
-    expect((await gw().call("cancel", running)).accepted).toBe(false);
+    expect((await gw().cancel(running)).accepted).toBe(false);
   });
 
   it("times out a run, escalating to SIGKILL when the harness ignores SIGTERM", async () => {
@@ -148,7 +148,7 @@ describe("cued end to end (fake harness)", () => {
     await waitFor(async () => ((await eventTypes(id)).includes("requeued") ? true : undefined), 5000, "requeue");
     const rec = await status(id);
     expect(rec).toMatchObject({ status: "queued", attempt: 0 });
-    const stats = await gw().call("stats");
+    const stats = await gw().stats();
     expect(stats.paused["claude:a"]).toBeGreaterThan(Date.now() + 30 * 60_000);
     await new Promise((r) => setTimeout(r, 300));
     expect((await status(id)).status).toBe("queued");
