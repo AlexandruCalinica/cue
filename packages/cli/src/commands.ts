@@ -6,6 +6,7 @@ export type Command =
   | { readonly kind: "list"; readonly limit: number; readonly json: boolean }
   | { readonly kind: "cancel"; readonly id: string }
   | { readonly kind: "logs"; readonly id: string; readonly lines: number }
+  | { readonly kind: "stats"; readonly json: boolean }
   | { readonly kind: "help" };
 
 export const USAGE = `usage:
@@ -14,6 +15,7 @@ export const USAGE = `usage:
   cue list [-n N] [--json]      recent jobs
   cue cancel <id>               cancel a queued job or kill a running one
   cue logs <id> [-n LINES]      tail of the job's harness output
+  cue stats [--json]            running jobs, pauses, budgets and lanes
 
 connection: CUE_SEEDS (host:gossipPort,... where gossipPort = daemon port + 2), CUE_COOKIE (cluster secret)
 optional:   CUE_REQUESTER (default: OS user), CUE_CLIENT_ADDRESS (bind/advertise, default 127.0.0.1),
@@ -40,6 +42,8 @@ export function parseCommand(argv: readonly string[]): Command {
       return id ? { kind: "cancel", id } : { kind: "help" };
     case "logs":
       return id ? { kind: "logs", id, lines: n ?? 100 } : { kind: "help" };
+    case "stats":
+      return { kind: "stats", json: values.json };
     default:
       return { kind: "help" };
   }

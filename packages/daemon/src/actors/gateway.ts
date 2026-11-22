@@ -1,9 +1,11 @@
-import { createActor, type ActorRef } from "libeam";
+import { createActor, type ActorRefFrom } from "libeam";
 import { z } from "zod";
 import { JOB_STATUSES, JobIdSchema, JobSpecSchema, isTerminal, newJobId, type JobId } from "@cue/core";
 import { route } from "@cue/router";
 import type { JobRecord } from "@cue/store";
 import { jobPaths, lastLines, type Runtime } from "../runtime.js";
+import type { JobRecordView } from "../types.js";
+import type { Scheduler, SchedulerStats } from "./scheduler.js";
 
 const ListQuerySchema = z.object({
   limit: z.number().int().positive().max(1000).optional(),
@@ -45,7 +47,7 @@ export interface CancelReply {
  * submissions, writes them to the store and pokes the scheduler. All replies
  * are plain JSON so they cross node boundaries unchanged.
  */
-export const Gateway = createActor((_ctx, self, rt: Runtime, scheduler: ActorRef) => {
+export const Gateway = createActor((_ctx, self, rt: Runtime, scheduler: ActorRefFrom<typeof Scheduler>) => {
   return self
     .onCall("ping", () => "pong" as const)
     .onCall("submit", (input: unknown): SubmitReply => {
@@ -61,10 +63,14 @@ export const Gateway = createActor((_ctx, self, rt: Runtime, scheduler: ActorRef
       const id = newJobId();
       rt.store.insertJob({ id, spec: normalised, candidates: decision.candidates });
       rt.store.appendEvent({ jobId: id, type: "submitted", data: { requester: spec.requester, rule: decision.rule, candidates: decision.candidates } });
-      scheduler.cast({ method: "poke", args: [] });
+      scheduler.cast("poke");
       return { id, rule: decision.rule, candidates: decision.candidates };
     })
-    .onCall("status", (id: unknown): JobRecord | null => rt.store.getJob(parse(JobIdSchema, id, "job id")))
+    .onCall("status", async (id: unknown): Promise<JobRecordView | null> => {
+      const rec = rt.store.getJob(parse(JobIdSchema, id, "job id"));
+      if (rec?.status !== "queued") return rec;
+      return { ...rec, waiting: await scheduler.call("waitReasons", rec.id) };
+    })
     .onCall("list", (query: unknown): readonly JobRecord[] => {
       const q = parse(ListQuerySchema, query ?? {}, "list query");
       return rt.store.listJobs({
@@ -91,5 +97,5 @@ export const Gateway = createActor((_ctx, self, rt: Runtime, scheduler: ActorRef
       const q = parse(z.object({ id: JobIdSchema, afterSeq: z.number().int().min(0).optional() }), query, "events query");
       return rt.store.readEvents({ jobId: q.id, ...(q.afterSeq === undefined ? {} : { afterSeq: q.afterSeq }) });
     })
-    .onCall("stats", () => scheduler.call({ method: "stats", args: [] }));
+    .onCall("stats", (): Promise<SchedulerStats> => scheduler.call("stats"));
 });

@@ -34,3 +34,9 @@ export function recordRateLimit({ state, resetsAt, now }: { state: QuotaState; r
   const until = Number.isFinite(parsed) && parsed > now ? parsed : now + DEFAULT_PAUSE_MS;
   return { ...state, pausedUntil: Math.max(until, state.pausedUntil ?? 0) };
 }
+
+/** Why {@link canStart} is false: an active pause, or the start window is full. `null` when a start is allowed. */
+export function startBlocker({ state, rule, now }: { state: QuotaState; rule: QuotaRule | undefined; now: number }): "paused" | "rate" | null {
+  if (state.pausedUntil !== null && now < state.pausedUntil) return "paused";
+  return canStart({ state, rule, now }) ? null : "rate";
+}
