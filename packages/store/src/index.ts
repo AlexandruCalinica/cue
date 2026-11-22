@@ -54,6 +54,34 @@ export interface ListQuery {
   readonly limit?: number;
 }
 
+export interface LeaseQuery {
+  readonly pool: string;
+  readonly owner: string;
+  readonly ttlMs: number;
+  readonly now: number;
+  /**
+   * Pools that can start a job right now. A job is only eligible for `pool` when
+   * no candidate it prefers over `pool` is in this list, so work stays on the
+   * preferred pool while it has room. Omitted: preference is not enforced.
+   */
+  readonly available?: readonly string[];
+  /** Lanes that may not start jobs (disabled or at their concurrency cap). */
+  readonly blockedLanes?: readonly string[];
+}
+
+/** Whether a queued job may be leased by `pool` under a {@link LeaseQuery}. */
+export function isEligible(
+  job: { readonly candidates: readonly string[]; readonly lane?: string | undefined },
+  query: Pick<LeaseQuery, "pool" | "available" | "blockedLanes">,
+): boolean {
+  const at = job.candidates.indexOf(query.pool);
+  if (at < 0) return false;
+  if (job.lane !== undefined && query.blockedLanes?.includes(job.lane)) return false;
+  const available = query.available;
+  if (available === undefined) return true;
+  return !job.candidates.slice(0, at).some((p) => available.includes(p));
+}
+
 /** A write was attempted with a lease the store no longer honours (expired and reclaimed, or superseded). */
 export class StaleLeaseError extends Error {
   constructor(readonly lease: Lease) {
@@ -74,9 +102,18 @@ export interface Store {
   listJobs(query: ListQuery): readonly JobRecord[];
   /**
    * Atomically take the best queued job that can run on `pool` (lowest priority,
-   * then oldest), bumping its fence and its attempt counter.
+   * then oldest), bumping its fence and its attempt counter. See {@link LeaseQuery}
+   * for preference order and lane filtering.
    */
-  leaseNext(input: { pool: string; owner: string; ttlMs: number; now: number }): Lease | null;
+  leaseNext(input: LeaseQuery): Lease | null;
+  /** Sum of `costUsd` over jobs that finished on `pool` at or after `since` (epoch ms). */
+  spendSince(input: { pool: string; since: number }): number;
+  /** Leased or running jobs per lane (jobs without a lane are not counted). */
+  activeLaneCounts(): Readonly<Record<string, number>>;
+  /** Persisted rate-limit pauses: pool key to epoch ms. */
+  poolPauses(): Readonly<Record<string, number>>;
+  /** Records (or with `null` clears) a pool's pause so it survives a restart. */
+  setPoolPause(input: { pool: string; until: number | null }): void;
   /** Extends a live lease. Throws {@link StaleLeaseError} if the lease was superseded. */
   renewLease(input: { lease: Lease; ttlMs: number; now: number }): Lease;
   /** Write-ahead phase change: recorded before the phase's side effects start. `run` marks the job running. */
@@ -114,7 +151,15 @@ export interface Store {
   close(): void;
 }
 
-export const SCHEMA_VERSION = 2;
+export const SCHEMA_VERSION = 3;
+
+const POOL_STATE_SCHEMA = `
+CREATE TABLE IF NOT EXISTS pool_state (
+  pool TEXT PRIMARY KEY,
+  paused_until INTEGER
+);
+CREATE INDEX IF NOT EXISTS jobs_finished ON jobs (pool, finished_at) WHERE finished_at IS NOT NULL;
+`;
 
 /** Schema of the SQLite store (version {@link SCHEMA_VERSION}). */
 export const SQLITE_SCHEMA = `
@@ -147,7 +192,7 @@ CREATE TABLE IF NOT EXISTS events (
   data TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS events_job ON events (job_id, seq);
-`;
+${POOL_STATE_SCHEMA}`;
 
 /** Parses a JSON text column, then validates it with `schema`. */
 const json = <T extends z.ZodType>(schema: T) =>
@@ -190,7 +235,10 @@ const EventRowSchema = z.object({
   type: z.string(),
   data: json(z.unknown()),
 });
-const IdRowSchema = z.object({ id: z.string() });
+const CandidateRowSchema = z.object({ id: z.string(), candidates: json(z.array(z.string())), lane: z.string().nullable() });
+const SumRowSchema = z.object({ total: z.number().nullable() });
+const LaneCountRowSchema = z.object({ lane: z.string(), n: z.number() });
+const PauseRowSchema = z.object({ pool: z.string(), paused_until: z.number() });
 const VersionRowSchema = z.object({ user_version: z.number() });
 
 const ACTIVE = `status IN ('leased', 'running')`;
@@ -246,6 +294,7 @@ function migrate(db: DatabaseSync): void {
     tx(db, () => {
       if (version === 0) db.exec(SQLITE_SCHEMA);
       if (version === 1) db.exec("ALTER TABLE jobs ADD COLUMN runtime TEXT");
+      if (version >= 1 && version < 3) db.exec(POOL_STATE_SCHEMA);
       db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
     });
   }
@@ -328,18 +377,25 @@ class SqliteStore implements Store {
       .map((row) => toRecord(JobRowSchema.parse(row)));
   }
 
-  leaseNext(input: { pool: string; owner: string; ttlMs: number; now: number }): Lease | null {
+  leaseNext(input: LeaseQuery): Lease | null {
     return tx(this.db, () => {
-      const found = this.db
+      const rows = this.db
         .prepare(
-          `SELECT id FROM jobs
+          `SELECT id, candidates, json_extract(spec, '$.lane') AS lane FROM jobs
            WHERE status = 'queued' AND cancel_requested = 0
              AND EXISTS (SELECT 1 FROM json_each(jobs.candidates) WHERE value = ?)
-           ORDER BY priority ASC, created_at ASC, rowid ASC LIMIT 1`,
+           ORDER BY priority ASC, created_at ASC, rowid ASC`,
         )
-        .get(input.pool);
-      if (found === undefined) return null;
-      const row = IdRowSchema.parse(found);
+        .iterate(input.pool);
+      let found: string | null = null;
+      for (const raw of rows) {
+        const row = CandidateRowSchema.parse(raw);
+        if (isEligible({ candidates: row.candidates, lane: row.lane ?? undefined }, input)) {
+          found = row.id;
+          break;
+        }
+      }
+      if (found === null) return null;
       const expires = input.now + input.ttlMs;
       this.run(
         `UPDATE jobs SET status = 'leased', pool = ?, phase = NULL, fence = fence + 1, attempt = attempt + 1,
@@ -347,12 +403,57 @@ class SqliteStore implements Store {
         input.pool,
         input.owner,
         expires,
-        row.id,
+        found,
       );
-      const updated = this.job(row.id);
-      if (!updated) throw new Error(`leased job ${row.id} vanished`);
+      const updated = this.job(found);
+      if (!updated) throw new Error(`leased job ${found} vanished`);
       return toLease(updated);
     });
+  }
+
+  spendSince(input: { pool: string; since: number }): number {
+    const row = SumRowSchema.parse(
+      this.db
+        .prepare(
+          `SELECT SUM(json_extract(result, '$.costUsd')) AS total FROM jobs
+           WHERE pool = ? AND finished_at IS NOT NULL AND finished_at >= ?`,
+        )
+        .get(input.pool, iso(input.since)),
+    );
+    return row.total ?? 0;
+  }
+
+  activeLaneCounts(): Readonly<Record<string, number>> {
+    const out: Record<string, number> = {};
+    const rows = this.db
+      .prepare(
+        `SELECT json_extract(spec, '$.lane') AS lane, COUNT(*) AS n FROM jobs
+         WHERE ${ACTIVE} AND json_extract(spec, '$.lane') IS NOT NULL GROUP BY lane`,
+      )
+      .all();
+    for (const raw of rows) {
+      const row = LaneCountRowSchema.parse(raw);
+      out[row.lane] = row.n;
+    }
+    return out;
+  }
+
+  poolPauses(): Readonly<Record<string, number>> {
+    const out: Record<string, number> = {};
+    for (const raw of this.db.prepare("SELECT pool, paused_until FROM pool_state WHERE paused_until IS NOT NULL").all()) {
+      const row = PauseRowSchema.parse(raw);
+      out[row.pool] = row.paused_until;
+    }
+    return out;
+  }
+
+  setPoolPause(input: { pool: string; until: number | null }): void {
+    this.run(
+      `INSERT INTO pool_state (pool, paused_until) VALUES (?, ?)
+       ON CONFLICT (pool) DO UPDATE SET paused_until = excluded.paused_until`,
+      input.pool,
+      input.until,
+    );
   }
 
   renewLease(input: { lease: Lease; ttlMs: number; now: number }): Lease {

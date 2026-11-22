@@ -24,11 +24,17 @@ pools:
     account: work
     concurrency: 2
     rate: { jobs: 20, windowSec: 3600 }
-  - harness: codex      # the Codex adapter arrives in M3; remove this pool to run cued today
+    budget: { usd: 25, windowSec: 86400 }   # pause the pool after $25 of finished jobs per day
+  - harness: codex
     concurrency: 1
+    options:
+      sandbox: workspace-write   # or read-only, danger-full-access
+      # bypassSandbox: true      # only when the host isolates the process another way
+      # config: { model_reasoning_effort: '"high"' }   # codex -c overrides (TOML values)
 
-lanes:                   # M3: parsed but not yet enforced
+lanes:                   # concurrency caps across all pools; a disabled lane holds its jobs
   team-a: { concurrency: 1 }
+  frozen: { concurrency: 1, enabled: false }
 
 routing:
   - name: investigations-prefer-codex
@@ -47,7 +53,11 @@ hooks:
     - run: [./hooks/record]
       required: false
 
-notify:                  # M3: parsed but not yet sent
+notify:                  # on: terminal | succeeded | failed | cancelled | timeout | flagged
   - kind: webhook
     url: https://example.com/cue-events
-    on: [terminal, denial]
+    on: [failed, timeout, flagged]
+    # headers: { authorization: "Bearer ..." }
+  - kind: command
+    run: [./hooks/notify-chat]           # reads $CUE_RESULT_JSON
+    on: [terminal]

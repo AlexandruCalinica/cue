@@ -26,8 +26,10 @@ const AttemptSchema = z.object({
   cancelSeen: z.boolean(),
   exitCode: z.number().nullable(),
   sessionId: z.string().nullable(),
+  /** Last assistant message, the report for harnesses whose result carries no text. */
+  lastMessage: z.string().nullable().default(null),
   result: z
-    .object({ ok: z.boolean(), text: z.string(), costUsd: z.number().nullable(), numTurns: z.number().nullable(), permissionDenials: z.number() })
+    .object({ ok: z.boolean(), text: z.string().nullable(), costUsd: z.number().nullable(), numTurns: z.number().nullable(), permissionDenials: z.number() })
     .nullable(),
   denials: z.number(),
   rateLimit: z.object({ resetsAt: z.string().nullable(), detail: z.string() }).nullable(),
@@ -53,6 +55,7 @@ const freshAttempt = (): Attempt => ({
   cancelSeen: false,
   exitCode: null,
   sessionId: null,
+  lastMessage: null,
   result: null,
   denials: 0,
   rateLimit: null,
@@ -268,6 +271,7 @@ export const JobActor = createActor((ctx, self, rt: Runtime, initial: Lease, poo
         event("session", ev);
         return;
       case "message":
+        st = { ...st, lastMessage: ev.text };
         event("message", { text: ev.text.slice(0, MESSAGE_EVENT_CHARS) });
         return;
       case "tool":
@@ -358,7 +362,7 @@ export const JobActor = createActor((ctx, self, rt: Runtime, initial: Lease, poo
       pool: key,
       exitCode: st.exitCode,
       error: decision.error,
-      report: st.result?.text ?? null,
+      report: st.result?.text ?? st.lastMessage,
       costUsd: st.result?.costUsd ?? null,
       numTurns: st.result?.numTurns ?? null,
       sessionId: st.sessionId,
@@ -419,6 +423,7 @@ export const JobActor = createActor((ctx, self, rt: Runtime, initial: Lease, poo
     writeJson(paths.resultJson, result);
     rt.store.finish({ lease, result });
     event("finished", { status: result.status, flags: result.flags });
+    void rt.notify({ result, jobDir: paths.dir, resultPath: paths.resultJson });
     stop("finished");
   }
 

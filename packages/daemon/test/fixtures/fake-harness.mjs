@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // A stand-in for `claude -p <prompt> --output-format stream-json`. The prompt is a
 // `;`-separated script: say <text> | sleep <sec> | deny <tool> | env <NAME> | pwd |
-// touch <path> | ignore-term | ratelimit | fail <msg> | exit <code>
+// touch <path> | ignore-term | ratelimit | ratelimit-if <ENV> | fail <msg> | exit <code>
 import { writeFileSync } from "node:fs";
 import process from "node:process";
 import { setTimeout } from "node:timers";
@@ -33,6 +33,9 @@ for (const raw of prompt.split(/;|\n\n/)) {
       out({ type: "system", subtype: "permission_denied", tool_name: arg, tool_use_id: "t1", message: `${arg} needs approval`, session_id: session });
       denials.push({ tool_name: arg, tool_use_id: "t1", tool_input: {} });
       break;
+    case "ratelimit-if":
+      if (!process.env[arg]) break;
+    // falls through
     case "ratelimit":
       out({ type: "rate_limit_event", rate_limit_info: { status: "rejected", resetsAt: Math.floor(Date.now() / 1000) + 3600, rateLimitType: "five_hour" }, session_id: session });
       out({ type: "result", subtype: "success", is_error: true, result: "You've hit your limit · resets 3pm (UTC)", num_turns: 1, total_cost_usd: 0, permission_denials: [], session_id: session });

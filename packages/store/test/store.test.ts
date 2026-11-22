@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { JobSpecSchema, parseJobId, type JobId, type JobResult, type JobSpecInput } from "@cue/core";
-import { openSqliteStore, SQLITE_SCHEMA, StaleLeaseError, type Store } from "@cue/store";
+import { isEligible, openSqliteStore, SQLITE_SCHEMA, StaleLeaseError, type Store } from "@cue/store";
 
 let seq = 0;
 const id = (): JobId => parseJobId(`job-20261120-${(++seq).toString(16).padStart(6, "0")}`);
@@ -197,8 +197,64 @@ function storeContract(name: string, open: () => Store) {
       expect(s.readEvents({ jobId: j, afterSeq: e1.seq }).map((e) => e.seq)).toEqual([e3.seq]);
       expect(s.readEvents({ jobId: j, limit: 1 })).toHaveLength(1);
     });
+
+    it("leases by preference: a later pool only takes jobs whose earlier pools are unavailable", () => {
+      const j = id();
+      s.insertJob({ id: j, spec: spec(), candidates: ["claude:a", "claude:b"] });
+      const q = (pool: string, available: string[]) => s.leaseNext({ pool, owner: "n", ttlMs: 1000, now: T0, available });
+      expect(q("claude:b", ["claude:a", "claude:b"])).toBeNull();
+      expect(q("claude:b", ["claude:b"])?.jobId).toBe(j);
+    });
+
+    it("skips jobs in blocked lanes without blocking others behind them", () => {
+      const blocked = id();
+      const free = id();
+      s.insertJob({ id: blocked, spec: spec({ lane: "x", priority: 1 }), candidates: ["claude:a"] });
+      s.insertJob({ id: free, spec: spec({ priority: 2 }), candidates: ["claude:a"] });
+      const l = s.leaseNext({ pool: "claude:a", owner: "n", ttlMs: 1000, now: T0, blockedLanes: ["x"] });
+      expect(l?.jobId).toBe(free);
+      expect(s.activeLaneCounts()).toEqual({});
+      expect(lease(s)?.jobId).toBe(blocked);
+      expect(s.activeLaneCounts()).toEqual({ x: 1 });
+    });
+
+    it("sums spend per pool inside a window", () => {
+      const at = Date.now();
+      for (const [cost, finishedAt] of [[0.5, at], [0.25, at - 60_000], [1, at - 3_600_000]] as const) {
+        const j = id();
+        s.insertJob({ id: j, spec: spec(), candidates: ["claude:a"] });
+        s.finish({ lease: must(lease(s)), result: { ...result(j), costUsd: cost, finishedAt: new Date(finishedAt).toISOString() } });
+      }
+      expect(s.spendSince({ pool: "claude:a", since: at - 120_000 })).toBeCloseTo(0.75);
+      expect(s.spendSince({ pool: "claude:b", since: 0 })).toBe(0);
+    });
+
+    it("persists and clears pool pauses", () => {
+      expect(s.poolPauses()).toEqual({});
+      s.setPoolPause({ pool: "claude:a", until: 123 });
+      s.setPoolPause({ pool: "claude:a", until: 456 });
+      s.setPoolPause({ pool: "codex:b", until: 7 });
+      expect(s.poolPauses()).toEqual({ "claude:a": 456, "codex:b": 7 });
+      s.setPoolPause({ pool: "codex:b", until: null });
+      expect(s.poolPauses()).toEqual({ "claude:a": 456 });
+    });
   });
 }
+
+describe("isEligible", () => {
+  const job = { candidates: ["a", "b", "c"], lane: "x" };
+  it("honours candidate order against available pools", () => {
+    expect(isEligible(job, { pool: "a", available: ["a", "b"] })).toBe(true);
+    expect(isEligible(job, { pool: "c", available: ["b", "c"] })).toBe(false);
+    expect(isEligible(job, { pool: "c", available: ["c"] })).toBe(true);
+    expect(isEligible(job, { pool: "c" })).toBe(true);
+    expect(isEligible(job, { pool: "z" })).toBe(false);
+  });
+  it("rejects jobs in blocked lanes", () => {
+    expect(isEligible(job, { pool: "a", blockedLanes: ["x"] })).toBe(false);
+    expect(isEligible({ candidates: ["a"] }, { pool: "a", blockedLanes: ["x"] })).toBe(true);
+  });
+});
 
 storeContract("sqlite :memory:", () => openSqliteStore(":memory:"));
 
@@ -240,6 +296,19 @@ describe("sqlite file store", () => {
     st.insertJob({ id: j, spec: spec(), candidates: ["claude:a"] });
     st.setRuntime({ lease: must(lease(st)), runtime: { ok: true } });
     expect(st.getRuntime(j)).toEqual({ ok: true });
+    st.close();
+  });
+
+  it("migrates a v2 database by adding pool_state", async () => {
+    const path = join(dir, "v2.db");
+    const { DatabaseSync } = await import("node:sqlite");
+    const raw = new DatabaseSync(path);
+    raw.exec(SQLITE_SCHEMA);
+    raw.exec("DROP TABLE pool_state; DROP INDEX jobs_finished; PRAGMA user_version = 2");
+    raw.close();
+    const st = openSqliteStore(path);
+    st.setPoolPause({ pool: "claude:a", until: 1 });
+    expect(st.poolPauses()).toEqual({ "claude:a": 1 });
     st.close();
   });
 

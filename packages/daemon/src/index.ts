@@ -7,3 +7,4 @@ export * from "./daemon.js";
 export { Gateway, GatewayError, type SubmitReply, type CancelReply } from "./actors/gateway.js";
 export { Scheduler, type SchedulerStats } from "./actors/scheduler.js";
 export { JobActor } from "./actors/job.js";
+export * from "./notify.js";

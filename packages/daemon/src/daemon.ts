@@ -8,7 +8,8 @@ import { Scheduler } from "./actors/scheduler.js";
 import { createScriptHookRunner, type HookRunner } from "./hooks.js";
 import { createProcessController, type ProcessController } from "./process.js";
 import { GATEWAY_NAME, gatewayClient, type GatewayClient } from "./protocol.js";
-import { ensureDir, poolMap, type Runtime } from "./runtime.js";
+import { createNotifier } from "./notify.js";
+import { ensureDir, errorMessage, poolMap, type Runtime } from "./runtime.js";
 
 /**
  * Supervision tree:
@@ -50,12 +51,14 @@ export async function startCued(options: CuedOptions): Promise<Cued> {
   const { config } = options;
   ensureDir(config.dataDir);
   const store = openSqliteStore(join(config.dataDir, "cue.db"));
+  const hooks = options.hooks ?? createScriptHookRunner();
   const rt: Runtime = {
     config,
     store,
     adapters: new Map(options.adapters.map((a) => [a.id, a])),
     processes: options.processes ?? createProcessController(config.isolation),
-    hooks: options.hooks ?? createScriptHookRunner(),
+    hooks,
+    notify: createNotifier({ notifiers: config.notify, hooks, store }),
     owner: config.node.id,
     pools: poolMap(config),
     baseEnv: options.baseEnv ?? process.env,
@@ -63,9 +66,16 @@ export async function startCued(options: CuedOptions): Promise<Cued> {
     now: () => Date.now(),
   };
   for (const pool of config.pools) {
-    if (!rt.adapters.has(pool.harness)) {
+    const adapter = rt.adapters.get(pool.harness);
+    if (!adapter) {
       store.close();
       throw new Error(`pool ${pool.harness}:${pool.account} uses unknown harness "${pool.harness}"`);
+    }
+    try {
+      adapter.validateOptions?.(pool.options);
+    } catch (err) {
+      store.close();
+      throw new Error(`pool ${pool.harness}:${pool.account} has invalid options: ${errorMessage(err)}`);
     }
   }
 

@@ -4,13 +4,13 @@ import { z } from "zod";
 import type { HookConfig, JobId } from "@cue/core";
 
 /** Lifecycle points where org-specific behaviour plugs in. */
-export type HookPoint = "preRun" | "postRun" | "onComplete";
+export type HookPoint = "preRun" | "postRun" | "onComplete" | "notify";
 
 /**
  * Hooks are plain executables. cue passes context through environment variables
  * and files, never through a shell:
  *   CUE_JOB_ID, CUE_HOOK, CUE_JOB_DIR, CUE_JOB_JSON (path to job.json),
- *   CUE_WORKDIR, CUE_RESULT_JSON (postRun/onComplete only).
+ *   CUE_WORKDIR, CUE_RESULT_JSON (postRun, onComplete and notify).
  * A preRun hook may print one JSON object on stdout matching {@link PreRunOutput}.
  */
 export interface HookContext {

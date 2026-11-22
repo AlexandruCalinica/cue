@@ -11,7 +11,8 @@ export type HarnessEvent =
   | {
       readonly kind: "result";
       readonly ok: boolean;
-      readonly text: string;
+      /** Final report. `null` when the harness has no final text and the last message is the report. */
+      readonly text: string | null;
       readonly costUsd: number | null;
       readonly numTurns: number | null;
       readonly permissionDenials: number;
@@ -48,6 +49,11 @@ export interface HarnessAdapter {
   /** Default executable when the pool sets no `bin`. */
   readonly defaultBin: readonly [string, ...string[]];
   build(input: BuildInput): Invocation;
-  /** Map one stdout line to zero or more events. Must never throw. */
+  /**
+   * Validates the pool's `options` at daemon boot, throwing a readable error.
+   * Adapters without options may omit it.
+   */
+  validateOptions?(options: Readonly<Record<string, unknown>>): void;
+  /** Map one stdout line to zero or more events. Must never throw. Stateless: lines may be replayed after a restart. */
   parseLine(line: string): readonly HarnessEvent[];
 }
