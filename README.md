@@ -5,11 +5,12 @@ harness (Claude Code, Codex CLI, Cursor agent, ...) and account by rules, runs i
 isolated process tree, and records every state change in SQLite. Built on
 [libeam](https://github.com/AlexandruCalinica/libeam), an Erlang/OTP-style actor system for TypeScript.
 
-> **Status: M3 (routing and harnesses) done.** `cued` runs Claude Code and Codex CLI jobs on one
+> **Status: M4 (identity and safety) done.** `cued` runs Claude Code and Codex CLI jobs on one
 > host: SQLite store with fenced leases, hooks, cancel/timeout, preference routing with fallback,
 > rate-limit pauses that survive restarts, spend budgets, lane caps, webhook/command
-> notifications, restart re-attach, and the `cue` client over libeam. The Cursor adapter, client
-> identity (M4) and multiple hosts (M5) come later; see [Milestones](#milestones).
+> notifications, restart re-attach, Ed25519-signed client calls with per-client permissions and
+> an audit log, a `blocked` outcome for permission denials, and the `cue` client over libeam.
+> The Cursor adapter and multiple hosts (M5) come later; see [Milestones](#milestones).
 
 cue is deliberately generic: it knows nothing about any company's repos, ticket system or
 release flow. Anything org-specific plugs in through [hooks](#extension-model-hooks-and-plugins).
@@ -40,12 +41,15 @@ release flow. Anything org-specific plugs in through [hooks](#extension-model-ho
                                               stdout → file, tailed through the harness adapter
 ```
 
-- **Gateway** (registered as `cue.gateway`) validates a submitted spec, caps `maxMinutes`, asks
-  the router for ordered candidate pools, writes the job and pokes the scheduler. It serves
-  `ping / submit / status / list / cancel / logs / events / stats`.
+- **Gateway** (registered as `cue.gateway`) authenticates each call (see [Clients](#clients)),
+  validates a submitted spec, applies the client's lane and limits, caps `maxMinutes`, asks the
+  router for ordered candidate pools, writes the job and pokes the scheduler. It serves
+  `ping / submit / status / list / cancel / logs / events / stats / audit`. `status` on a queued
+  job adds `waiting`: why each candidate pool (or the job's lane) can't take it yet.
 - **Router** is a pure function over `cue.yaml` rules: the first rule whose `match`
-  (labels, requester, lane) fits yields an ordered list of pools or harnesses; a job may pin
-  `harness: claude` or `harness: claude:work`.
+  (labels, requester, lane, verified client) fits yields an ordered list of pools or harnesses;
+  a job may pin `harness: claude` or `harness: claude:work`. A client's `pools` allow-list then
+  filters the candidates.
 - **Scheduler** runs on every tick and every poke. It reclaims expired leases (their old holders
   are fenced out), then works out which pools are *available*: enabled, with a free slot, inside
   their start quota (`rate: {jobs, windowSec}`), not paused by a rate limit and under their spend
@@ -78,23 +82,25 @@ release flow. Anything org-specific plugs in through [hooks](#extension-model-ho
 - **Store** is SQLite (`node:sqlite`, WAL, versioned schema). Leases carry a monotonically
   increasing `fence`; every write by a lease holder presents it, and stale holders get
   `StaleLeaseError`. The `Store` interface has contract tests any other backend must pass.
-- **Results are honest**: a run that "succeeded" with permission denials is flagged
-  `permission-denied`, a harness that exits without a result line fails, and unparseable output
-  is flagged rather than ignored.
+- **Results are honest**: permission denials inside the harness are counted and, depending on
+  `safety.onDenial` (or a pool's `onDenial`), either flag the result `permission-denied`
+  (`flag`, the default) or end the job as **`blocked`** with the denied tools in its error
+  (`block`). A harness that exits without a result line fails, and unparseable output is flagged
+  rather than ignored.
 
 ### Harness adapters
 
 An adapter is pure: `build(input) → { argv, env }` and `parseLine(line) → HarnessEvent[]`,
 plus an optional `validateOptions(pool.options)` that `cued` runs at boot. The daemon owns
 processes, isolation, timeouts and kills, so every harness gets the same guarantees. Events are
-normalised (`session`, `message`, `tool`, `denial`, `rate_limit`, `result`, `unparsed`) so
+normalised (`session`, `message`, `tool`, `denial`, `flag`, `rate_limit`, `result`, `unparsed`) so
 routing, quota and notifications don't depend on one vendor's format. A `result` without text
 means "the last message is the report".
 
 | Adapter | Command | Pool `options` | Notes |
 |---|---|---|---|
 | `claude` | `claude -p … --output-format stream-json --verbose` | none | cost, turns, permission denials and rate-limit resets reported |
-| `codex` | `codex exec --json --skip-git-repo-check -C <workdir> --sandbox … -- <prompt>` | `sandbox` (`workspace-write` default, `read-only`, `danger-full-access`), `bypassSandbox`, `config` (`-c` overrides) | no cost reported, so budgets count Codex jobs as $0; sandbox refusals appear only in prose, not as denials; usage limits parsed from "try again in …" |
+| `codex` | `codex exec --json --skip-git-repo-check -C <workdir> --sandbox … -- <prompt>` | `sandbox` (`workspace-write` default, `read-only`, `danger-full-access`), `bypassSandbox`, `config` (`-c` overrides) | no cost reported, so budgets count Codex jobs as $0; a failed command whose output shows a sandbox refusal is a denial, while refusals Codex only describes in prose (what 0.171 does) add the `possible-sandbox-refusal` flag; usage limits parsed from "try again in …" |
 
 Fixtures under `packages/harness/test/fixtures/<adapter>/` are recorded from real runs and
 sanitised; their READMEs list which ones are hand-written.
@@ -102,9 +108,23 @@ sanitised; their READMEs list which ones are hand-written.
 ### Clients
 
 `cue` is a libeam node. It joins the cluster through `CUE_SEEDS` with the shared `CUE_COOKIE`,
-looks up `cue.gateway` and calls it. The libeam cookie only gates cluster membership, so **per-client
-identity is planned for M4**: each client gets an Ed25519 key and signs requests (client, nonce,
-timestamp, body hash); the Gateway checks them against an allow-list with per-client verbs and lanes.
+looks up `cue.gateway` and calls it. The cookie only gates cluster membership, so cue adds
+**per-client identity** on top:
+
+- `cue keygen --out dev.pem` writes an Ed25519 private key (mode 0600) and prints the public key
+  for `clients.<name>.publicKey` in `cue.yaml`.
+- The client signs every call (`CUE_CLIENT` + `CUE_KEY_FILE`) over its name, a timestamp, a
+  random nonce, the method and a SHA-256 of the canonical JSON arguments.
+- Once any `clients` are configured, the Gateway rejects unsigned calls, unknown clients, bad
+  signatures, timestamps outside `auth.clockSkewSec` (60 s), replayed nonces (kept in the store,
+  so a restart doesn't reopen the window) and verbs the client wasn't granted. With no clients
+  it stays open, and `cued` warns about it at boot.
+- Per client: `verbs`, `scope` (`own` sees and cancels only its own jobs, others look missing;
+  `all` sees everything), `lanes` and `defaultLane`, a `pools` allow-list, `maxActive`
+  unfinished jobs and a `maxMinutes` cap. Jobs record their verified `client`; `requester` stays
+  a free-form label.
+- The **audit log** (store table, `cue audit`) records every submit and cancel and every
+  rejected call, with the client, method, job and reason. `ping` is never signed or audited.
 
 ## Extension model: hooks and plugins
 
@@ -140,6 +160,12 @@ echo '{"prompt": "Fix the flaky test in src/foo.test.ts", "workdir": "/srv/repo"
 node packages/cli/dist/cue.js status <id>
 node packages/cli/dist/cue.js logs <id> -n 50
 node packages/cli/dist/cue.js cancel <id>
+node packages/cli/dist/cue.js stats               # running jobs, pauses, spend, lanes
+
+# with clients in cue.yaml, every call is signed:
+node packages/cli/dist/cue.js keygen --out ~/.config/cue/dev.pem   # add the printed key to cue.yaml
+export CUE_CLIENT=dev CUE_KEY_FILE=~/.config/cue/dev.pem
+node packages/cli/dist/cue.js audit -n 20         # needs the audit verb
 ```
 
 Each job gets `<dataDir>/jobs/<id>/` with `job.json`, the harness `stdout`/`stderr`, `exit-code`
@@ -174,8 +200,10 @@ machine-local files (`.djournal.json`, `.journal/`, `.claude/settings.json`) are
 - **M3 – routing and more harnesses** (done): Codex adapter (fixture-backed), preference routing
   with fallback, persisted rate-limit pauses, spend budgets, lane caps, webhook/command
   notifications. The Cursor adapter is deferred.
-- **M4 – identity and safety**: per-client Ed25519 keys, verbs and lanes per client, audit events,
-  permission-denial detection.
+- **M4 – identity and safety** (done): Ed25519-signed calls with nonce and clock checks,
+  per-client verbs, scope, lanes and limits, routing on verified clients, an audit log, a
+  `flag | block` denial policy with the `blocked` status, Codex refusal detection, plus
+  `cue stats` and wait reasons for queued jobs.
 - **M5 – multiple hosts**: runner nodes with libeam roles; store-backed leases across nodes.
 
 ## libeam notes

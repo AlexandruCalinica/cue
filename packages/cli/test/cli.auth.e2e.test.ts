@@ -57,6 +57,7 @@ describe("cue CLI with client keys", () => {
     const id = submitted.stdout.trim();
     expect(id).toMatch(/^job-/);
     expect(JSON.parse((await cue("dev", ["status", id, "--json"])).stdout)).toMatchObject({ id, client: "dev" });
+    expect((await cue("dev", ["status", id])).stdout).toContain("client dev  requester cli-tester");
 
     const unsigned = await cue(null, ["list"]);
     expect(unsigned.code).toBe(1);

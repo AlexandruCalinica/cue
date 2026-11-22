@@ -25,6 +25,7 @@ pools:
     concurrency: 2
     rate: { jobs: 20, windowSec: 3600 }
     budget: { usd: 25, windowSec: 86400 }   # pause the pool after $25 of finished jobs per day
+    # onDenial: flag                        # overrides safety.onDenial for this pool
   - harness: codex
     concurrency: 1
     options:
@@ -40,6 +41,9 @@ routing:
   - name: investigations-prefer-codex
     match: { labels: [investigate] }
     use: [codex, claude]
+  - name: ci-bot-on-codex
+    match: { client: [ci-bot] }          # verified client name, unlike the self-asserted requester
+    use: [codex]
   - name: everything-else
     use: [claude:work]
 
@@ -53,7 +57,7 @@ hooks:
     - run: [./hooks/record]
       required: false
 
-notify:                  # on: terminal | succeeded | failed | cancelled | timeout | flagged
+notify:                  # on: terminal | succeeded | failed | blocked | cancelled | timeout | flagged
   - kind: webhook
     url: https://example.com/cue-events
     on: [failed, timeout, flagged]
@@ -61,3 +65,27 @@ notify:                  # on: terminal | succeeded | failed | cancelled | timeo
   - kind: command
     run: [./hooks/notify-chat]           # reads $CUE_RESULT_JSON
     on: [terminal]
+
+# Client identity. With any clients listed, every gateway call must be signed by one of them
+# (`cue keygen` makes a key; the CLI signs with CUE_CLIENT + CUE_KEY_FILE). With none, the
+# gateway is open to anyone holding CUE_COOKIE.
+clients:
+  ci-bot:
+    publicKey: P7wLsVJs5T95hHGf7Mm2_SxMRyVPJZ7wf0o6lTqwjK0   # example key; replace with yours
+    verbs: [submit, status, logs, events]                  # default also includes list and cancel
+    scope: own               # only its own jobs (default); `all` sees and cancels everything
+    lanes: [team-a]
+    defaultLane: team-a
+    pools: [codex]           # pool keys or harness ids its jobs may use
+    maxActive: 5             # unfinished jobs at once
+    maxMinutes: 30
+  ops:
+    publicKey: rFdjuhGg2ECQIz6fTF0_-znDlmyk2F4XE1DEixJHOZg   # example key; replace with yours
+    verbs: [status, list, cancel, logs, events, stats, audit]
+    scope: all
+
+auth:
+  clockSkewSec: 60           # accepted gap between a request's timestamp and the daemon's clock
+
+safety:
+  onDenial: block            # flag (default): keep the status, add `permission-denied`; block: end as `blocked`

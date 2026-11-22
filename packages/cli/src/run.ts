@@ -73,7 +73,7 @@ function columns(head: readonly string[], rows: readonly (readonly string[])[]):
 function summary(rec: JobRecordView): string {
   const lines = [
     `${rec.id}  ${rec.status}${rec.cancelRequested && rec.status !== "cancelled" ? " (cancel requested)" : ""}`,
-    `  requester ${rec.spec.requester}  pool ${rec.pool ?? "-"}  attempt ${rec.attempt}  phase ${rec.phase ?? "-"}`,
+    `  ${rec.client === null ? "" : `client ${rec.client}  `}requester ${rec.spec.requester}  pool ${rec.pool ?? "-"}  attempt ${rec.attempt}  phase ${rec.phase ?? "-"}`,
     `  created ${rec.createdAt}  started ${rec.startedAt ?? "-"}  finished ${rec.finishedAt ?? "-"}`,
   ];
   if (rec.waiting !== undefined && rec.waiting.length > 0) {
