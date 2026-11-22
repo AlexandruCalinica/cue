@@ -4,6 +4,7 @@ import { poolKey, type CueConfig, type JobId, type PoolConfig } from "@cue/core"
 import type { HarnessAdapter } from "@cue/harness";
 import type { Store } from "@cue/store";
 import type { HookRunner } from "./hooks.js";
+import type { Notify } from "./notify.js";
 import type { ProcessController } from "./process.js";
 
 /** Everything the actors share. Built once by {@link startCued}; actors receive it as a spawn arg. */
@@ -13,6 +14,8 @@ export interface Runtime {
   readonly adapters: ReadonlyMap<string, HarnessAdapter>;
   readonly processes: ProcessController;
   readonly hooks: HookRunner;
+  /** Delivers `notify` entries for a finished job (best effort, never rejects). */
+  readonly notify: Notify;
   /** Lease owner for this node. Stable across restarts so a restarted daemon adopts its own jobs. */
   readonly owner: string;
   readonly pools: ReadonlyMap<string, PoolConfig>;

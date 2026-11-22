@@ -423,6 +423,7 @@ export const JobActor = createActor((ctx, self, rt: Runtime, initial: Lease, poo
     writeJson(paths.resultJson, result);
     rt.store.finish({ lease, result });
     event("finished", { status: result.status, flags: result.flags });
+    void rt.notify({ result, jobDir: paths.dir, resultPath: paths.resultJson });
     stop("finished");
   }
 

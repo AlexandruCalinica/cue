@@ -8,6 +8,7 @@ import { Scheduler } from "./actors/scheduler.js";
 import { createScriptHookRunner, type HookRunner } from "./hooks.js";
 import { createProcessController, type ProcessController } from "./process.js";
 import { GATEWAY_NAME, gatewayClient, type GatewayClient } from "./protocol.js";
+import { createNotifier } from "./notify.js";
 import { ensureDir, errorMessage, poolMap, type Runtime } from "./runtime.js";
 
 /**
@@ -50,12 +51,14 @@ export async function startCued(options: CuedOptions): Promise<Cued> {
   const { config } = options;
   ensureDir(config.dataDir);
   const store = openSqliteStore(join(config.dataDir, "cue.db"));
+  const hooks = options.hooks ?? createScriptHookRunner();
   const rt: Runtime = {
     config,
     store,
     adapters: new Map(options.adapters.map((a) => [a.id, a])),
     processes: options.processes ?? createProcessController(config.isolation),
-    hooks: options.hooks ?? createScriptHookRunner(),
+    hooks,
+    notify: createNotifier({ notifiers: config.notify, hooks, store }),
     owner: config.node.id,
     pools: poolMap(config),
     baseEnv: options.baseEnv ?? process.env,

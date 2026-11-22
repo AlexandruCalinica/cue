@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
+import { TERMINAL_STATUSES } from "./job.js";
 
 const HookSchema = z.object({
   /** Executable (absolute or on PATH) and its arguments. Run without a shell. */
@@ -53,9 +54,26 @@ const RuleSchema = z.object({
   use: z.array(z.string().min(1)).min(1),
 });
 
+/** When a notifier fires: any terminal status, one status, or a finished job with flags. */
+export const NOTIFY_ON = ["terminal", ...TERMINAL_STATUSES, "flagged"] as const;
+const NotifyOnSchema = z.array(z.enum(NOTIFY_ON)).min(1).default(["terminal"]);
+
 const NotifierSchema = z.discriminatedUnion("kind", [
-  z.object({ kind: z.literal("webhook"), url: z.url(), on: z.array(z.string()).default(["terminal"]) }),
-  z.object({ kind: z.literal("command"), run: z.array(z.string().min(1)).min(1), on: z.array(z.string()).default(["terminal"]) }),
+  z.object({
+    kind: z.literal("webhook"),
+    url: z.url(),
+    /** Extra request headers (e.g. authorization). Values are never logged. */
+    headers: z.record(z.string(), z.string()).default({}),
+    on: NotifyOnSchema,
+    timeoutSec: z.number().positive().default(10),
+  }),
+  z.object({
+    kind: z.literal("command"),
+    /** Run without a shell, with the hook environment (`CUE_HOOK=notify`, `CUE_RESULT_JSON`, ...). */
+    run: z.array(z.string().min(1)).min(1),
+    on: NotifyOnSchema,
+    timeoutSec: z.number().positive().default(30),
+  }),
 ]);
 
 export const CueConfigSchema = z.object({
