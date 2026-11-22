@@ -15,7 +15,9 @@ export const USAGE = `usage:
   cue cancel <id>               cancel a queued job or kill a running one
   cue logs <id> [-n LINES]      tail of the job's harness output
 
-connection: CUE_SEEDS (host:gossipPort,...), CUE_COOKIE (cluster secret)`;
+connection: CUE_SEEDS (host:gossipPort,... where gossipPort = daemon port + 2), CUE_COOKIE (cluster secret)
+optional:   CUE_REQUESTER (default: OS user), CUE_CLIENT_ADDRESS (bind/advertise, default 127.0.0.1),
+            CUE_CONNECT_TIMEOUT_MS (default 10000)`;
 
 /** Pure argv parsing so the CLI contract is testable without a cluster. */
 export function parseCommand(argv: readonly string[]): Command {

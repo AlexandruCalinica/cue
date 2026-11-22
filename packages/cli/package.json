@@ -12,6 +12,7 @@
   },
   "dependencies": {
     "@cue/core": "0.0.0",
+    "@cue/daemon": "0.0.0",
     "libeam": "0.3.0"
   },
   "bin": {

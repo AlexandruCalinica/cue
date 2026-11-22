@@ -5,7 +5,10 @@ const pkg = (name: string) => fileURLToPath(new URL(`./packages/${name}/src/inde
 
 export default defineConfig({
   resolve: {
-    alias: Object.fromEntries(["core", "store", "harness", "router", "daemon", "cli"].map((n) => [`@cue/${n}`, pkg(n)])),
+    alias: [
+      { find: "@cue/daemon/protocol", replacement: fileURLToPath(new URL("./packages/daemon/src/protocol.ts", import.meta.url)) },
+      ...["core", "store", "harness", "router", "daemon", "cli"].map((n) => ({ find: `@cue/${n}`, replacement: pkg(n) })),
+    ],
   },
   test: { include: ["packages/*/test/**/*.test.ts"] },
 });

@@ -24,10 +24,10 @@ pools:
     account: work
     concurrency: 2
     rate: { jobs: 20, windowSec: 3600 }
-  - harness: codex
+  - harness: codex      # the Codex adapter arrives in M3; remove this pool to run cued today
     concurrency: 1
 
-lanes:
+lanes:                   # M3: parsed but not yet enforced
   team-a: { concurrency: 1 }
 
 routing:
@@ -47,7 +47,7 @@ hooks:
     - run: [./hooks/record]
       required: false
 
-notify:
+notify:                  # M3: parsed but not yet sent
   - kind: webhook
     url: https://example.com/cue-events
     on: [terminal, denial]

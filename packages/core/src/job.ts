@@ -58,20 +58,27 @@ export function isTerminal(status: JobStatus): status is TerminalStatus {
 export const PHASES = ["prepare", "run", "post", "finalize", "done"] as const;
 export type Phase = (typeof PHASES)[number];
 
+/** Zod schema for a {@link JobId}, for decoding stored or wire data. */
+export const JobIdSchema = z.custom<JobId>((v) => typeof v === "string" && isJobId(v), "invalid job id");
+
 /** Summary written to `result.json` and returned by `cue status`. */
-export interface JobResult {
-  readonly id: JobId;
-  readonly status: TerminalStatus;
-  readonly pool: string | null;
-  readonly exitCode: number | null;
-  readonly error: string | null;
-  readonly report: string | null;
-  readonly costUsd: number | null;
-  readonly numTurns: number | null;
-  readonly sessionId: string | null;
-  readonly permissionDenials: number;
-  /** Things a human should look at even when the status is `succeeded`. */
-  readonly flags: readonly string[];
-  readonly startedAt: string | null;
-  readonly finishedAt: string;
-}
+export const JobResultSchema = z
+  .object({
+    id: JobIdSchema,
+    status: z.enum(TERMINAL_STATUSES),
+    pool: z.string().nullable(),
+    exitCode: z.number().int().nullable(),
+    error: z.string().nullable(),
+    report: z.string().nullable(),
+    costUsd: z.number().nullable(),
+    numTurns: z.number().int().nullable(),
+    sessionId: z.string().nullable(),
+    permissionDenials: z.number().int().min(0),
+    /** Things a human should look at even when the status is `succeeded`. */
+    flags: z.array(z.string()).readonly(),
+    startedAt: z.string().nullable(),
+    finishedAt: z.string(),
+  })
+  .readonly();
+
+export type JobResult = z.infer<typeof JobResultSchema>;
