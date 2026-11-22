@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { loggerConfig } from "libeam";
 import { loadConfig } from "@cue/core";
-import { claudeAdapter } from "@cue/harness";
+import { claudeAdapter, codexAdapter } from "@cue/harness";
 import { startCued } from "./daemon.js";
 
 const configPath = process.argv[2] ?? "cue.yaml";
@@ -10,7 +10,7 @@ loggerConfig.level = level === "debug" || level === "info" || level === "error" 
 
 async function main(): Promise<void> {
   const config = loadConfig(configPath);
-  const cued = await startCued({ config, adapters: [claudeAdapter] });
+  const cued = await startCued({ config, adapters: [claudeAdapter, codexAdapter] });
   const { port, bindAddress } = config.node;
   process.stderr.write(`cued: node ${cued.nodeId} up; clients use CUE_SEEDS=${config.node.advertiseAddress ?? bindAddress}:${port + 2}\n`);
 

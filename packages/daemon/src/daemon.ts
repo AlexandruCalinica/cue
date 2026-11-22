@@ -8,7 +8,7 @@ import { Scheduler } from "./actors/scheduler.js";
 import { createScriptHookRunner, type HookRunner } from "./hooks.js";
 import { createProcessController, type ProcessController } from "./process.js";
 import { GATEWAY_NAME, gatewayClient, type GatewayClient } from "./protocol.js";
-import { ensureDir, poolMap, type Runtime } from "./runtime.js";
+import { ensureDir, errorMessage, poolMap, type Runtime } from "./runtime.js";
 
 /**
  * Supervision tree:
@@ -63,9 +63,16 @@ export async function startCued(options: CuedOptions): Promise<Cued> {
     now: () => Date.now(),
   };
   for (const pool of config.pools) {
-    if (!rt.adapters.has(pool.harness)) {
+    const adapter = rt.adapters.get(pool.harness);
+    if (!adapter) {
       store.close();
       throw new Error(`pool ${pool.harness}:${pool.account} uses unknown harness "${pool.harness}"`);
+    }
+    try {
+      adapter.validateOptions?.(pool.options);
+    } catch (err) {
+      store.close();
+      throw new Error(`pool ${pool.harness}:${pool.account} has invalid options: ${errorMessage(err)}`);
     }
   }
 
