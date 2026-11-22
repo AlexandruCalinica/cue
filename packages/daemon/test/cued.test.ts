@@ -4,10 +4,13 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { isTerminal, parseConfig, type CueConfigInput, type JobId, type JobSpecInput } from "@cue/core";
-import { claudeAdapter } from "@cue/harness";
+import { claudeAdapter, codexAdapter } from "@cue/harness";
 import { startCued, type Cued, type JobRecordView } from "@cue/daemon";
 
 const FAKE = fileURLToPath(new URL("./fixtures/fake-harness.mjs", import.meta.url));
+const adapterFixture = (path: string) => fileURLToPath(new URL(`../../harness/test/fixtures/${path}`, import.meta.url));
+/** A "harness" that prints a recorded run and ignores the arguments the adapter adds. */
+const replay = (path: string) => [process.execPath, "-e", "process.stdout.write(require('fs').readFileSync(process.argv[1]))", adapterFixture(path)];
 
 async function waitFor<T>(fn: () => Promise<T | undefined> | T | undefined, timeoutMs = 10_000, label = "condition"): Promise<T> {
   const until = Date.now() + timeoutMs;
@@ -113,6 +116,53 @@ describe("cued end to end (fake harness)", () => {
     const rec = await settle(await submit("deny Bash; say I could not run it"));
     expect(rec.status).toBe("succeeded");
     expect(rec.result).toMatchObject({ permissionDenials: 1, flags: ["permission-denied"] });
+  });
+
+  it("ends a job as blocked under the block policy, with a per-pool override", async () => {
+    const fake = [process.execPath, FAKE];
+    await start({
+      safety: { onDenial: "block" },
+      pools: [
+        { harness: "claude", account: "a", bin: fake },
+        { harness: "claude", account: "lenient", bin: fake, onDenial: "flag" },
+      ],
+    });
+    const blocked = await settle(await submit("deny Bash; deny Edit; deny Bash; say I could not run it", { harness: "claude:a" }));
+    expect(blocked.status).toBe("blocked");
+    expect(blocked.result).toMatchObject({ status: "blocked", error: "blocked by 3 permission denials (Bash, Edit)", permissionDenials: 3, report: "I could not run it" });
+    expect(blocked.result?.flags).toContain("permission-denied");
+
+    // A harness error with denials is still blocked: the denials are the likely cause.
+    expect((await settle(await submit("deny Bash; fail gave up", { harness: "claude:a" }))).status).toBe("blocked");
+    expect((await settle(await submit("say clean", { harness: "claude:a" }))).status).toBe("succeeded");
+
+    const lenient = await settle(await submit("deny Bash; say done anyway", { harness: "claude:lenient" }));
+    expect(lenient.status).toBe("succeeded");
+    expect(lenient.result?.flags).toContain("permission-denied");
+  });
+
+  it("replays the recorded Claude and Codex denial runs as blocked", async () => {
+    cued = await startCued({
+      config: config({
+        safety: { onDenial: "block" },
+        pools: [
+          { harness: "claude", account: "a", bin: replay("claude/deny.jsonl") },
+          { harness: "codex", bin: replay("codex/command-denied.jsonl") },
+          { harness: "codex", account: "prose", bin: replay("codex/sandbox-refusal.jsonl") },
+        ],
+      }),
+      adapters: [claudeAdapter, codexAdapter],
+      network: { kind: "local" },
+      killGraceMs: 300,
+    });
+    const claude = await settle(await submit("touch x.txt", { harness: "claude:a" }));
+    expect(claude).toMatchObject({ status: "blocked", result: { permissionDenials: 1, error: "blocked by 1 permission denial (Bash)" } });
+    const codex = await settle(await submit("touch /var/tmp/probe", { harness: "codex:default" }));
+    expect(codex).toMatchObject({ status: "blocked", result: { permissionDenials: 1, error: "blocked by 1 permission denial (shell)" } });
+    // A refusal only described in prose is flagged, not blocked.
+    const prose = await settle(await submit("touch /var/tmp/probe", { harness: "codex:prose" }));
+    expect(prose.status).toBe("succeeded");
+    expect(prose.result?.flags).toContain("possible-sandbox-refusal");
   });
 
   it("cancels queued and running jobs, killing the harness", async () => {

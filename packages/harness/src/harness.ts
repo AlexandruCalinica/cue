@@ -7,6 +7,8 @@ export type HarnessEvent =
   | { readonly kind: "message"; readonly text: string }
   | { readonly kind: "tool"; readonly name: string }
   | { readonly kind: "denial"; readonly tool: string; readonly detail: string }
+  /** Something a human should check (added to the result's flags) that isn't a confirmed denial. */
+  | { readonly kind: "flag"; readonly flag: string; readonly detail: string }
   | { readonly kind: "rate_limit"; readonly resetsAt: string | null; readonly detail: string }
   | {
       readonly kind: "result";

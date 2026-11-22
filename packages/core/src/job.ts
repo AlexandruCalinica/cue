@@ -45,7 +45,8 @@ export const JobSpecSchema = z.object({
 export type JobSpec = z.infer<typeof JobSpecSchema>;
 export type JobSpecInput = z.input<typeof JobSpecSchema>;
 
-export const TERMINAL_STATUSES = ["succeeded", "failed", "cancelled", "timeout"] as const;
+/** `blocked`: the harness hit permission denials and the denial policy is `block`. */
+export const TERMINAL_STATUSES = ["succeeded", "failed", "blocked", "cancelled", "timeout"] as const;
 export const JOB_STATUSES = ["queued", "leased", "running", ...TERMINAL_STATUSES] as const;
 export type TerminalStatus = (typeof TERMINAL_STATUSES)[number];
 export type JobStatus = (typeof JOB_STATUSES)[number];

@@ -32,6 +32,8 @@ const AttemptSchema = z.object({
     .object({ ok: z.boolean(), text: z.string().nullable(), costUsd: z.number().nullable(), numTurns: z.number().nullable(), permissionDenials: z.number() })
     .nullable(),
   denials: z.number(),
+  /** Tools named by denial events, in order, without repeats. */
+  deniedTools: z.array(z.string()).default([]),
   rateLimit: z.object({ resetsAt: z.string().nullable(), detail: z.string() }).nullable(),
   unparsed: z.number(),
   flags: z.array(z.string()),
@@ -58,6 +60,7 @@ const freshAttempt = (): Attempt => ({
   lastMessage: null,
   result: null,
   denials: 0,
+  deniedTools: [],
   rateLimit: null,
   unparsed: 0,
   flags: [],
@@ -278,8 +281,12 @@ export const JobActor = createActor((ctx, self, rt: Runtime, initial: Lease, poo
         event("tool", ev);
         return;
       case "denial":
-        st = { ...st, denials: st.denials + 1 };
+        st = { ...st, denials: st.denials + 1, deniedTools: st.deniedTools.includes(ev.tool) ? st.deniedTools : [...st.deniedTools, ev.tool] };
         event("denial", ev);
+        return;
+      case "flag":
+        if (!st.flags.includes(ev.flag)) st = { ...st, flags: [...st.flags, ev.flag] };
+        event("flag", ev);
         return;
       case "rate_limit":
         // A later signal without a reset time (e.g. the result text) must not erase a known one.
@@ -344,6 +351,11 @@ export const JobActor = createActor((ctx, self, rt: Runtime, initial: Lease, poo
     if (st.verdict !== null) return { status: st.verdict, error: st.error };
     if (st.killedFor === "cancel") return { status: "cancelled", error: "cancelled while running" };
     if (st.killedFor === "timeout") return { status: "timeout", error: `exceeded ${maxRunMs(spec(), rt.config.limits) / 60_000} minutes` };
+    const denials = Math.max(st.denials, st.result?.permissionDenials ?? 0);
+    if (denials > 0 && (pool.onDenial ?? rt.config.safety.onDenial) === "block") {
+      const tools = st.deniedTools.length > 0 ? ` (${st.deniedTools.join(", ")})` : "";
+      return { status: "blocked", error: `blocked by ${denials} permission denial${denials === 1 ? "" : "s"}${tools}` };
+    }
     if (st.exitCode === 0 && st.result?.ok === true) return { status: "succeeded", error: null };
     if (st.result !== null && !st.result.ok) return { status: "failed", error: st.result.text || "harness reported an error" };
     if (st.error !== null) return { status: "failed", error: st.error };

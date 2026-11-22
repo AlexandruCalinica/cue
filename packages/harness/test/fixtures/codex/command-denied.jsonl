@@ -1,0 +1,6 @@
+{"type":"thread.started","thread_id":"00000000-0000-7000-8000-000000000006"}
+{"type":"turn.started"}
+{"type":"item.started","item":{"id":"item_0","type":"command_execution","command":"/bin/bash -lc 'touch /var/tmp/probe'","aggregated_output":"","exit_code":null,"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_0","type":"command_execution","command":"/bin/bash -lc 'touch /var/tmp/probe'","aggregated_output":"touch: cannot touch '/var/tmp/probe': Read-only file system\n","exit_code":1,"status":"failed"}}
+{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"The command failed."}}
+{"type":"turn.completed","usage":{"input_tokens":100,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":10,"reasoning_output_tokens":0}}
