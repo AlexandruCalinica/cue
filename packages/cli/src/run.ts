@@ -1,4 +1,4 @@
-import type { JobRecordView, SchedulerStats, WaitReason } from "@cue/daemon";
+import type { AuditRecord, JobRecordView, SchedulerStats, WaitReason } from "@cue/daemon";
 import type { GatewayClient } from "@cue/daemon/protocol";
 import type { Command } from "./commands.js";
 
@@ -94,8 +94,16 @@ function table(records: readonly JobRecordView[]): string {
   return columns(["ID", "STATUS", "POOL", "REQUESTER", "CREATED", "PROMPT"], rows).join("\n");
 }
 
+function auditTable(records: readonly AuditRecord[]): string {
+  const rows = records.map((a) => [a.at, a.client ?? "-", a.method, a.ok ? "ok" : "denied", a.jobId ?? "-", a.reason ?? ""]);
+  return columns(["AT", "CLIENT", "METHOD", "RESULT", "JOB", "REASON"], rows).join("\n");
+}
+
+/** Commands that talk to the daemon (everything except `help` and `keygen`). */
+export type RemoteCommand = Exclude<Command, { kind: "help" } | { kind: "keygen" }>;
+
 /** Executes one parsed command against the gateway. Returns the process exit code. */
-export async function runCommand(command: Exclude<Command, { kind: "help" }>, gateway: GatewayClient, io: Io): Promise<number> {
+export async function runCommand(command: RemoteCommand, gateway: GatewayClient, io: Io): Promise<number> {
   switch (command.kind) {
     case "submit": {
       const text = await io.read(command.file);
@@ -135,6 +143,11 @@ export async function runCommand(command: Exclude<Command, { kind: "help" }>, ga
     case "stats": {
       const stats = await gateway.stats();
       io.out(command.json ? `${JSON.stringify(stats, null, 2)}\n` : `${formatStats(stats)}\n`);
+      return 0;
+    }
+    case "audit": {
+      const records = await gateway.audit({ limit: command.limit, ...(command.client === null ? {} : { client: command.client }) });
+      io.out(command.json ? `${JSON.stringify(records, null, 2)}\n` : `${auditTable(records)}\n`);
       return 0;
     }
     case "logs": {

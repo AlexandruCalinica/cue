@@ -1,6 +1,6 @@
 import { randomBytes } from "node:crypto";
 import { createSystem, type System } from "libeam";
-import { GATEWAY_NAME, gatewayClient, type GatewayClient } from "@cue/daemon/protocol";
+import { GATEWAY_NAME, gatewayClient, type GatewayClient, type Signer } from "@cue/daemon/protocol";
 
 /**
  * The CLI is itself a short-lived libeam node: it joins the cluster via
@@ -16,6 +16,8 @@ export interface ClientOptions {
   readonly port?: number;
   /** How long to wait for the gateway to appear. Default 10 s. */
   readonly timeoutMs?: number;
+  /** Signs each request; omit for daemons without `clients`. */
+  readonly signer?: Signer;
 }
 
 export interface CueClient {
@@ -56,7 +58,7 @@ export async function connect(options: ClientOptions): Promise<CueClient> {
   try {
     for (;;) {
       const ref = await system.getActorByName(GATEWAY_NAME);
-      if (ref) return { gateway: gatewayClient(ref), close: () => system.shutdown() };
+      if (ref) return { gateway: gatewayClient(ref, options.signer ? { signer: options.signer } : {}), close: () => system.shutdown() };
       if (Date.now() > until) throw new Error(`no ${GATEWAY_NAME} reachable via ${options.seeds.join(", ")}`);
       await new Promise((r) => setTimeout(r, 50));
     }

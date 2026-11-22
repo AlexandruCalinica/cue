@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
+import { parsePublicKey } from "./auth.js";
 import { TERMINAL_STATUSES } from "./job.js";
 
 const HookSchema = z.object({
@@ -38,6 +39,8 @@ const PoolSchema = z.object({
   rate: RateSchema.optional(),
   /** Spend cap: the pool pauses while finished jobs in the last `windowSec` cost `usd` or more. */
   budget: BudgetSchema.optional(),
+  /** Overrides `safety.onDenial` for this pool. */
+  onDenial: z.enum(["flag", "block"]).optional(),
   enabled: z.boolean().default(true),
 });
 
@@ -48,10 +51,34 @@ const RuleSchema = z.object({
       labels: z.array(z.string()).optional(),
       requester: z.array(z.string()).optional(),
       lane: z.array(z.string()).optional(),
+      /** Verified client names (see `clients`). Unlike `requester`, a client can't claim another's name. */
+      client: z.array(z.string()).optional(),
     })
     .default({}),
   /** Ordered pool keys (`harness:account`) or harness ids; the first available one wins. */
   use: z.array(z.string().min(1)).min(1),
+});
+
+/** Gateway verbs a client may be granted. `ping` is always allowed and never audited. */
+export const CLIENT_VERBS = ["submit", "status", "list", "cancel", "logs", "events", "stats", "audit"] as const;
+export type ClientVerb = (typeof CLIENT_VERBS)[number];
+
+const ClientSchema = z.object({
+  /** Raw Ed25519 public key, base64url (`cue keygen` prints it). */
+  publicKey: z.string().min(1),
+  verbs: z.array(z.enum(CLIENT_VERBS)).min(1).default(["submit", "status", "list", "cancel", "logs", "events"]),
+  /** `own`: status, list, logs, events and cancel only see this client's jobs. `all`: every job. */
+  scope: z.enum(["own", "all"]).default("own"),
+  /** Lanes this client may submit to. Omitted: any lane, or none. */
+  lanes: z.array(z.string().min(1)).min(1).optional(),
+  /** Lane applied when a submission names none. */
+  defaultLane: z.string().min(1).optional(),
+  /** Pool keys or harness ids this client's jobs may run on. Omitted: any. */
+  pools: z.array(z.string().min(1)).min(1).optional(),
+  /** Most unfinished (queued, leased or running) jobs this client may have at once. */
+  maxActive: z.number().int().positive().optional(),
+  /** Upper bound for this client's `maxMinutes`, on top of `limits.maxMaxMinutes`. */
+  maxMinutes: z.number().positive().optional(),
 });
 
 /** When a notifier fires: any terminal status, one status, or a finished job with flags. */
@@ -120,6 +147,26 @@ export const CueConfigSchema = z.object({
     })
     .prefault({}),
   notify: z.array(NotifierSchema).default([]),
+  /**
+   * Known clients by name. When any are configured every Gateway call must be
+   * signed by one of them; with none the Gateway accepts unsigned calls.
+   */
+  clients: z.record(z.string().regex(/^[A-Za-z0-9._@-]{1,200}$/), ClientSchema).default({}),
+  auth: z
+    .object({
+      /** Accepted difference between a request's timestamp and the daemon's clock. */
+      clockSkewSec: z.number().int().positive().max(3600).default(60),
+    })
+    .prefault({}),
+  safety: z
+    .object({
+      /**
+       * What a permission denial inside the harness does to the job: `flag` adds the
+       * `permission-denied` flag and keeps the status; `block` ends the job as `blocked`.
+       */
+      onDenial: z.enum(["flag", "block"]).default("flag"),
+    })
+    .prefault({}),
 });
 
 export type CueConfig = z.infer<typeof CueConfigSchema>;
@@ -128,6 +175,7 @@ export type PoolConfig = CueConfig["pools"][number];
 export type HookConfig = CueConfig["hooks"]["preRun"][number];
 export type RuleConfig = CueConfig["routing"][number];
 export type NotifierConfig = CueConfig["notify"][number];
+export type ClientConfig = CueConfig["clients"][string];
 
 export function poolKey(pool: Pick<PoolConfig, "harness" | "account">): string {
   return `${pool.harness}:${pool.account}`;
@@ -138,6 +186,20 @@ export function parseConfig(input: unknown): CueConfig {
   const keys = config.pools.map(poolKey);
   const dup = keys.find((k, i) => keys.indexOf(k) !== i);
   if (dup) throw new Error(`duplicate pool ${dup}`);
+  const seen = new Map<string, string>();
+  for (const [name, client] of Object.entries(config.clients)) {
+    try {
+      parsePublicKey(client.publicKey);
+    } catch (err) {
+      throw new Error(`client ${name}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    const other = seen.get(client.publicKey);
+    if (other !== undefined) throw new Error(`clients ${other} and ${name} share a public key`);
+    seen.set(client.publicKey, name);
+    if (client.defaultLane !== undefined && client.lanes !== undefined && !client.lanes.includes(client.defaultLane)) {
+      throw new Error(`client ${name}: defaultLane ${client.defaultLane} is not in its lanes`);
+    }
+  }
   return config;
 }
 

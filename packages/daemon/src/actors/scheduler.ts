@@ -54,16 +54,26 @@ export const Scheduler = createActor((ctx, self, rt: Runtime) => {
 
   const count = (pool: string) => [...running.values()].filter((r) => r.pool === pool).length;
 
-  function spawnJob(lease: Lease, pool: string): void {
+  /** Starts a JobActor for `lease`. Returns false, after handing the job back, when that isn't possible. */
+  function spawnJob(lease: Lease, pool: string): boolean {
     const cfg = rt.pools.get(pool);
     if (!cfg) {
       rt.store.appendEvent({ jobId: lease.jobId, type: "error", data: { message: `unknown pool ${pool}` } });
       rt.store.requeue({ lease, refundAttempt: true });
-      return;
+      return false;
     }
-    const ref = ctx.spawn(JobActor, { args: [rt, lease, cfg, ctx.self] });
+    let ref: ActorRef;
+    try {
+      ref = ctx.spawn(JobActor, { args: [rt, lease, cfg, ctx.self] });
+    } catch (err) {
+      // Typically the system is shutting down: hand the job back rather than let its lease expire.
+      rt.store.appendEvent({ jobId: lease.jobId, type: "error", data: { message: `spawn failed: ${errorMessage(err)}` } });
+      rt.store.requeue({ lease, refundAttempt: true });
+      return false;
+    }
     ctx.watch(ref);
     running.set(lease.jobId, { pool, ref });
+    return true;
   }
 
   /** Re-attaches to jobs this node held before a restart. */
@@ -159,7 +169,8 @@ export const Scheduler = createActor((ctx, self, rt: Runtime) => {
         const lane = rt.store.getJob(lease.jobId)?.spec.lane;
         if (lane !== undefined) laneCounts[lane] = (laneCounts[lane] ?? 0) + 1;
         rt.store.appendEvent({ jobId: lease.jobId, type: "leased", data: { pool: key, fence: lease.fence } });
-        spawnJob(lease, key);
+        // A failed spawn (shutdown) ends this pass instead of leasing the same job again.
+        if (!spawnJob(lease, key)) return;
         progress = true;
       }
     }

@@ -5,3 +5,4 @@ export type { PoolBlocker, SchedulerStats, WaitReason } from "./actors/scheduler
 
 /** What the Gateway returns to clients. `waiting` is set on queued jobs by `status`. */
 export type JobRecordView = JobRecord & { readonly waiting?: readonly WaitReason[] };
+export type { AuditRecord, StoredEvent } from "@cue/store";
