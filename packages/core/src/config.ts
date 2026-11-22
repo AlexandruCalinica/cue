@@ -16,6 +16,11 @@ const RateSchema = z.object({
   windowSec: z.number().int().positive(),
 });
 
+const BudgetSchema = z.object({
+  usd: z.number().positive(),
+  windowSec: z.number().int().positive(),
+});
+
 const PoolSchema = z.object({
   /** Adapter id registered with the daemon, e.g. `claude`. */
   harness: z.string().min(1),
@@ -30,6 +35,8 @@ const PoolSchema = z.object({
   /** Adapter-specific options, validated by the adapter itself. */
   options: z.record(z.string(), z.unknown()).default({}),
   rate: RateSchema.optional(),
+  /** Spend cap: the pool pauses while finished jobs in the last `windowSec` cost `usd` or more. */
+  budget: BudgetSchema.optional(),
   enabled: z.boolean().default(true),
 });
 
