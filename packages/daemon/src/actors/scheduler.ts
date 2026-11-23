@@ -1,5 +1,5 @@
 import { createActor, type ActorRef } from "libeam";
-import { budgetWindowStart, canStart, EMPTY_QUOTA, overBudget, recordRateLimit, recordStart, type QuotaState } from "@cue/router";
+import { budgetWindowStart, EMPTY_QUOTA, overBudget, recordRateLimit, recordStart, startBlocker, type QuotaState } from "@cue/router";
 import type { JobId } from "@cue/core";
 import type { Lease } from "@cue/store";
 import { errorMessage, type Runtime } from "../runtime.js";
@@ -9,6 +9,17 @@ interface Running {
   readonly pool: string;
   readonly ref: ActorRef;
 }
+
+/** Why a pool can't start a job right now. */
+export type PoolBlocker = "disabled" | "full" | "paused" | "rate" | "over-budget";
+
+/** One reason a queued job is still waiting. */
+export type WaitReason =
+  | { readonly kind: "pool"; readonly pool: string; readonly blocker: PoolBlocker; readonly until: number | null }
+  | { readonly kind: "unknown-pool"; readonly pool: string }
+  | { readonly kind: "lane"; readonly lane: string; readonly blocker: "disabled" | "full" }
+  /** A candidate pool is free but other jobs are ahead in the queue (or the next tick hasn't run). */
+  | { readonly kind: "queue"; readonly pool: string };
 
 export interface SchedulerStats {
   readonly running: Readonly<Record<string, readonly string[]>>;
@@ -43,16 +54,26 @@ export const Scheduler = createActor((ctx, self, rt: Runtime) => {
 
   const count = (pool: string) => [...running.values()].filter((r) => r.pool === pool).length;
 
-  function spawnJob(lease: Lease, pool: string): void {
+  /** Starts a JobActor for `lease`. Returns false, after handing the job back, when that isn't possible. */
+  function spawnJob(lease: Lease, pool: string): boolean {
     const cfg = rt.pools.get(pool);
     if (!cfg) {
       rt.store.appendEvent({ jobId: lease.jobId, type: "error", data: { message: `unknown pool ${pool}` } });
       rt.store.requeue({ lease, refundAttempt: true });
-      return;
+      return false;
     }
-    const ref = ctx.spawn(JobActor, { args: [rt, lease, cfg, ctx.self] });
+    let ref: ActorRef;
+    try {
+      ref = ctx.spawn(JobActor, { args: [rt, lease, cfg, ctx.self] });
+    } catch (err) {
+      // Typically the system is shutting down: hand the job back rather than let its lease expire.
+      rt.store.appendEvent({ jobId: lease.jobId, type: "error", data: { message: `spawn failed: ${errorMessage(err)}` } });
+      rt.store.requeue({ lease, refundAttempt: true });
+      return false;
+    }
     ctx.watch(ref);
     running.set(lease.jobId, { pool, ref });
+    return true;
   }
 
   /** Re-attaches to jobs this node held before a restart. */
@@ -75,6 +96,42 @@ export const Scheduler = createActor((ctx, self, rt: Runtime) => {
     return budget ? rt.store.spendSince({ pool: key, since: budgetWindowStart(budget, now) }) : null;
   }
 
+  function overSpentPools(now: number): Set<string> {
+    return new Set([...rt.pools.keys()].filter((key) => overBudget(rt.pools.get(key)?.budget, spentUsd(key, now) ?? 0)));
+  }
+
+  /** Why `key` can't start a job now, or `null` when it can. */
+  function blocker(key: string, now: number, overSpent: ReadonlySet<string>): PoolBlocker | null {
+    const pool = rt.pools.get(key);
+    if (!pool?.enabled) return "disabled";
+    if (count(key) >= pool.concurrency) return "full";
+    if (overSpent.has(key)) return "over-budget";
+    return startBlocker({ state: quotas.get(key) ?? EMPTY_QUOTA, rule: pool.rate, now });
+  }
+
+  function waitReasons(id: JobId): WaitReason[] {
+    const job = rt.store.getJob(id);
+    if (job?.status !== "queued") return [];
+    const reasons: WaitReason[] = [];
+    const lane = job.spec.lane === undefined ? undefined : rt.config.lanes[job.spec.lane];
+    if (job.spec.lane !== undefined && lane !== undefined) {
+      if (!lane.enabled) reasons.push({ kind: "lane", lane: job.spec.lane, blocker: "disabled" });
+      else if ((rt.store.activeLaneCounts()[job.spec.lane] ?? 0) >= lane.concurrency) reasons.push({ kind: "lane", lane: job.spec.lane, blocker: "full" });
+    }
+    const now = rt.now();
+    const overSpent = overSpentPools(now);
+    for (const pool of job.candidates) {
+      if (!rt.pools.has(pool)) {
+        reasons.push({ kind: "unknown-pool", pool });
+        continue;
+      }
+      const b = blocker(pool, now, overSpent);
+      if (b === null) reasons.push({ kind: "queue", pool });
+      else reasons.push({ kind: "pool", pool, blocker: b, until: b === "paused" ? (quotas.get(pool)?.pausedUntil ?? null) : null });
+    }
+    return reasons;
+  }
+
   function blockedLanes(counts: Readonly<Record<string, number>>): string[] {
     return Object.entries(rt.config.lanes)
       .filter(([name, lane]) => !lane.enabled || (counts[name] ?? 0) >= lane.concurrency)
@@ -87,12 +144,8 @@ export const Scheduler = createActor((ctx, self, rt: Runtime) => {
       running.delete(lease.jobId);
       rt.store.appendEvent({ jobId: lease.jobId, type: "lease-expired", data: { owner: lease.owner, fence: lease.fence } });
     }
-    const overSpent = new Set([...rt.pools.keys()].filter((key) => overBudget(rt.pools.get(key)?.budget, spentUsd(key, now) ?? 0)));
-    const available = (key: string): boolean => {
-      const pool = rt.pools.get(key);
-      if (!pool?.enabled || count(key) >= pool.concurrency || overSpent.has(key)) return false;
-      return canStart({ state: quotas.get(key) ?? EMPTY_QUOTA, rule: pool.rate, now });
-    };
+    const overSpent = overSpentPools(now);
+    const available = (key: string): boolean => blocker(key, now, overSpent) === null;
     const laneCounts: Record<string, number> = { ...rt.store.activeLaneCounts() };
     const ttlMs = rt.config.limits.leaseTtlSec * 1000;
 
@@ -116,7 +169,8 @@ export const Scheduler = createActor((ctx, self, rt: Runtime) => {
         const lane = rt.store.getJob(lease.jobId)?.spec.lane;
         if (lane !== undefined) laneCounts[lane] = (laneCounts[lane] ?? 0) + 1;
         rt.store.appendEvent({ jobId: lease.jobId, type: "leased", data: { pool: key, fence: lease.fence } });
-        spawnJob(lease, key);
+        // A failed spawn (shutdown) ends this pass instead of leasing the same job again.
+        if (!spawnJob(lease, key)) return;
         progress = true;
       }
     }
@@ -144,6 +198,7 @@ export const Scheduler = createActor((ctx, self, rt: Runtime) => {
     .onInfo("down", (msg: { actorRef: ActorRef }) => {
       forget((_id, r) => r.ref.id.id === msg.actorRef.id.id);
     })
+    .onCall("waitReasons", (id: JobId): WaitReason[] => waitReasons(id))
     .onCall("stats", (): SchedulerStats => {
       const byPool: Record<string, string[]> = {};
       for (const [id, r] of running) (byPool[r.pool] ??= []).push(id);

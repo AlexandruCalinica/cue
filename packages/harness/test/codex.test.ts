@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { JobSpecSchema, newJobId, parseConfig } from "@cue/core";
-import { codexAdapter, codexResetsAt, type HarnessEvent } from "@cue/harness";
+import { CODEX_REFUSAL_FLAG, codexAdapter, codexResetsAt, type HarnessEvent } from "@cue/harness";
 
 const fixture = (name: string): HarnessEvent[] =>
   readFileSync(new URL(`./fixtures/codex/${name}.jsonl`, import.meta.url), "utf8")
@@ -58,6 +58,26 @@ describe("codex adapter", () => {
     expect(events.filter((e) => e.kind === "tool")).toEqual([{ kind: "tool", name: "shell" }]);
     expect(events.filter((e) => e.kind === "message")).toHaveLength(2);
     expect(events.some((e) => e.kind === "unparsed")).toBe(false);
+  });
+
+  it("flags a refusal Codex only reports in prose, without counting a denial", () => {
+    for (const name of ["tool", "sandbox-refusal"]) {
+      const events = fixture(name);
+      expect(events.filter((e) => e.kind === "flag").map((e) => e.kind === "flag" && e.flag)).toEqual([CODEX_REFUSAL_FLAG]);
+      expect(events.some((e) => e.kind === "denial")).toBe(false);
+    }
+    expect(fixture("ok").some((e) => e.kind === "flag")).toBe(false);
+  });
+
+  it("turns a failed command with sandbox refusal output into a denial", () => {
+    const events = fixture("command-denied");
+    expect(events).toContainEqual({ kind: "denial", tool: "shell", detail: "touch: cannot touch '/var/tmp/probe': Read-only file system" });
+    expect(events.some((e) => e.kind === "unparsed")).toBe(false);
+    // A failing command without refusal output is just a tool call.
+    const plain = codexAdapter.parseLine(
+      JSON.stringify({ type: "item.completed", item: { id: "i", type: "command_execution", command: "false", aggregated_output: "", exit_code: 1, status: "failed" } }),
+    );
+    expect(plain).toEqual([{ kind: "tool", name: "shell" }]);
   });
 
   it("reports a failed turn as a not-ok result, ignoring non-fatal error items", () => {

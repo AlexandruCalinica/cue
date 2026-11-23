@@ -7,7 +7,7 @@ import { Gateway } from "./actors/gateway.js";
 import { Scheduler } from "./actors/scheduler.js";
 import { createScriptHookRunner, type HookRunner } from "./hooks.js";
 import { createProcessController, type ProcessController } from "./process.js";
-import { GATEWAY_NAME, gatewayClient, type GatewayClient } from "./protocol.js";
+import { GATEWAY_NAME, gatewayClient, type GatewayClient, type Signer } from "./protocol.js";
 import { createNotifier } from "./notify.js";
 import { ensureDir, errorMessage, poolMap, type Runtime } from "./runtime.js";
 
@@ -41,7 +41,10 @@ export interface CuedOptions {
 
 export interface Cued {
   readonly nodeId: string;
+  /** In-process Gateway client sending unsigned requests (enough when no `clients` are configured). */
   readonly gateway: GatewayClient;
+  /** In-process Gateway client whose requests are wrapped by `signer`. */
+  gatewayAs(signer: Signer): GatewayClient;
   readonly system: System;
   /** Stops the actors and closes the store. Harness processes keep running. */
   shutdown(): Promise<void>;
@@ -116,6 +119,7 @@ export async function startCued(options: CuedOptions): Promise<Cued> {
   return {
     nodeId: system.nodeId,
     gateway: gatewayClient(gateway),
+    gatewayAs: (signer) => gatewayClient(gateway, { signer }),
     system,
     async shutdown() {
       if (closed) return;

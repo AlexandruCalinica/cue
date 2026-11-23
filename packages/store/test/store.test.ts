@@ -27,6 +27,9 @@ function result(jobId: JobId, status: JobResult["status"] = "succeeded"): JobRes
   };
 }
 
+/** The v3 schema: no `client` column and no nonce/audit tables. */
+const V3_SCHEMA = SQLITE_SCHEMA.slice(0, SQLITE_SCHEMA.indexOf("CREATE TABLE IF NOT EXISTS nonces")).replace(",\n  client TEXT", "");
+
 const T0 = 1_000_000;
 const lease = (s: Store, pool = "claude:a", owner = "node-1", now = T0) => s.leaseNext({ pool, owner, ttlMs: 1000, now });
 
@@ -238,6 +241,44 @@ function storeContract(name: string, open: () => Store) {
       s.setPoolPause({ pool: "codex:b", until: null });
       expect(s.poolPauses()).toEqual({ "claude:a": 456 });
     });
+
+    it("records the submitting client, filters and counts unfinished jobs by it", () => {
+      const a1 = id();
+      const a2 = id();
+      s.insertJob({ id: a1, spec: spec(), candidates: ["claude:a"], client: "alice" });
+      s.insertJob({ id: a2, spec: spec(), candidates: ["claude:a"], client: "alice" });
+      s.insertJob({ id: id(), spec: spec(), candidates: ["claude:a"], client: "bob" });
+      s.insertJob({ id: id(), spec: spec(), candidates: ["claude:a"] });
+      expect(s.getJob(a1)?.client).toBe("alice");
+      expect(s.listJobs({ client: "alice" }).map((j) => j.id).sort()).toEqual([a1, a2].sort());
+      expect(s.countUnfinished("alice")).toBe(2);
+      s.requestCancel(a1);
+      expect(s.countUnfinished("alice")).toBe(1);
+      const l = must(lease(s));
+      expect(l.jobId).toBe(a2);
+      expect(s.countUnfinished("alice")).toBe(1);
+      s.finish({ lease: l, result: result(a2) });
+      expect(s.countUnfinished("alice")).toBe(0);
+    });
+
+    it("accepts a nonce once per client until it expires", () => {
+      expect(s.useNonce({ client: "alice", nonce: "n1", expiresAt: 100, now: 0 })).toBe(true);
+      expect(s.useNonce({ client: "alice", nonce: "n1", expiresAt: 100, now: 50 })).toBe(false);
+      expect(s.useNonce({ client: "bob", nonce: "n1", expiresAt: 100, now: 50 })).toBe(true);
+      // Expired nonces are pruned, so the same value is accepted again.
+      expect(s.useNonce({ client: "alice", nonce: "n1", expiresAt: 300, now: 200 })).toBe(true);
+    });
+
+    it("appends audit records and reads them newest first", () => {
+      s.appendAudit({ client: "alice", method: "submit", ok: true, reason: null, jobId: "job-20261120-aaaaaa" });
+      s.appendAudit({ client: null, method: "list", ok: false, reason: "unauthorized: unsigned request", jobId: null });
+      s.appendAudit({ client: "bob", method: "cancel", ok: false, reason: "forbidden", jobId: null });
+      const all = s.readAudit({});
+      expect(all.map((a) => a.method)).toEqual(["cancel", "list", "submit"]);
+      expect(all[1]).toMatchObject({ client: null, ok: false, reason: "unauthorized: unsigned request" });
+      expect(s.readAudit({ client: "alice" })).toHaveLength(1);
+      expect(s.readAudit({ limit: 1 })[0]?.method).toBe("cancel");
+    });
   });
 }
 
@@ -288,7 +329,7 @@ describe("sqlite file store", () => {
     const path = join(dir, "v1.db");
     const { DatabaseSync } = await import("node:sqlite");
     const raw = new DatabaseSync(path);
-    raw.exec(SQLITE_SCHEMA.replace(",\n  runtime TEXT", ""));
+    raw.exec(V3_SCHEMA.replace(",\n  runtime TEXT", ""));
     raw.exec("PRAGMA user_version = 1");
     raw.close();
     const st = openSqliteStore(path);
@@ -303,12 +344,27 @@ describe("sqlite file store", () => {
     const path = join(dir, "v2.db");
     const { DatabaseSync } = await import("node:sqlite");
     const raw = new DatabaseSync(path);
-    raw.exec(SQLITE_SCHEMA);
+    raw.exec(V3_SCHEMA);
     raw.exec("DROP TABLE pool_state; DROP INDEX jobs_finished; PRAGMA user_version = 2");
     raw.close();
     const st = openSqliteStore(path);
     st.setPoolPause({ pool: "claude:a", until: 1 });
     expect(st.poolPauses()).toEqual({ "claude:a": 1 });
+    st.close();
+  });
+
+  it("migrates a v3 database by adding the client column, nonces and audit", async () => {
+    const path = join(dir, "v3.db");
+    const { DatabaseSync } = await import("node:sqlite");
+    const raw = new DatabaseSync(path);
+    raw.exec(V3_SCHEMA);
+    raw.exec("PRAGMA user_version = 3");
+    raw.close();
+    const st = openSqliteStore(path);
+    const j = id();
+    expect(st.insertJob({ id: j, spec: spec(), candidates: ["claude:a"], client: "bot" }).client).toBe("bot");
+    expect(st.useNonce({ client: "bot", nonce: "n1", expiresAt: 10, now: 0 })).toBe(true);
+    expect(st.appendAudit({ client: "bot", method: "submit", ok: true, reason: null, jobId: j }).ok).toBe(true);
     st.close();
   });
 

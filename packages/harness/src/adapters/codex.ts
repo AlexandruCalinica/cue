@@ -24,6 +24,12 @@ const ItemSchema = z.looseObject({ id: z.string().optional(), type: z.string() }
 const ItemCompletedSchema = z.object({ type: z.literal("item.completed"), item: ItemSchema });
 
 const AgentMessageSchema = z.object({ type: z.literal("agent_message"), text: z.string() });
+const CommandExecutionSchema = z.looseObject({
+  type: z.literal("command_execution"),
+  aggregated_output: z.string().nullish(),
+  exit_code: z.number().nullish(),
+  status: z.string().nullish(),
+});
 const McpToolCallSchema = z.looseObject({ type: z.literal("mcp_tool_call"), server: z.string().optional(), tool: z.string().optional() });
 
 const ErrorSchema = z.object({ type: z.literal("error"), message: z.string() });
@@ -40,6 +46,11 @@ const TOOL_ITEMS: Readonly<Record<string, string>> = {
 /** Event and item types that carry nothing cue needs. */
 const IGNORED_TYPES = new Set(["turn.started", "item.started", "item.updated"]);
 const IGNORED_ITEMS = new Set(["reasoning", "todo_list", "error"]);
+
+/** Output of a command the OS sandbox stopped (Landlock/seccomp on Linux, Seatbelt on macOS). */
+const REFUSAL_RE = /(read-only file ?system|operation not permitted|permission denied|denied by (the )?sandbox|sandbox (denied|refused|blocked))/i;
+/** Flag shown when the agent's own words suggest a refusal that Codex didn't report as a failed command. */
+export const CODEX_REFUSAL_FLAG = "possible-sandbox-refusal";
 
 const LIMIT_RE = /(usage limit|rate limit|too many requests|\b429\b)/i;
 const RETRY_IN_RE = /try again in ((?:\d+\s*(?:days?|hours?|minutes?|mins?|seconds?|secs?)[\s,]*(?:and\s+)?)+)/i;
@@ -63,7 +74,22 @@ function rateLimit(message: string): HarnessEvent[] {
 
 function parseItem(item: z.infer<typeof ItemSchema>): HarnessEvent[] {
   const message = AgentMessageSchema.safeParse(item);
-  if (message.success) return message.data.text.trim() === "" ? [] : [{ kind: "message", text: message.data.text }];
+  if (message.success) {
+    const text = message.data.text;
+    if (text.trim() === "") return [];
+    // Codex (0.171) logs no item for a command the sandbox refused; the agent only says so in prose.
+    return REFUSAL_RE.test(text) ? [{ kind: "message", text }, { kind: "flag", flag: CODEX_REFUSAL_FLAG, detail: text.slice(0, 200) }] : [{ kind: "message", text }];
+  }
+  const command = CommandExecutionSchema.safeParse(item);
+  if (command.success) {
+    const { aggregated_output: output, exit_code: exitCode, status } = command.data;
+    const failed = status === "failed" || (typeof exitCode === "number" && exitCode !== 0);
+    if (failed && output && REFUSAL_RE.test(output)) {
+      const detail = output.split("\n").find((l) => REFUSAL_RE.test(l))?.trim().slice(0, 200) ?? "";
+      return [{ kind: "tool", name: "shell" }, { kind: "denial", tool: "shell", detail }];
+    }
+    return [{ kind: "tool", name: "shell" }];
+  }
   const toolName = TOOL_ITEMS[item.type];
   if (toolName !== undefined) return [{ kind: "tool", name: toolName }];
   const mcp = McpToolCallSchema.safeParse(item);

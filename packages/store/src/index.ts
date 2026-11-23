@@ -18,6 +18,8 @@ import {
 export interface JobRecord {
   readonly id: JobId;
   readonly spec: JobSpec;
+  /** Verified client that submitted the job; `null` when the Gateway ran without clients. */
+  readonly client: string | null;
   readonly status: JobStatus;
   readonly phase: Phase | null;
   /** Ordered pool keys from the router. */
@@ -51,6 +53,7 @@ export interface StoredEvent {
 export interface ListQuery {
   readonly status?: readonly JobStatus[];
   readonly requester?: string;
+  readonly client?: string;
   readonly limit?: number;
 }
 
@@ -67,6 +70,19 @@ export interface LeaseQuery {
   readonly available?: readonly string[];
   /** Lanes that may not start jobs (disabled or at their concurrency cap). */
   readonly blockedLanes?: readonly string[];
+}
+
+/** One Gateway call as recorded in the audit log. */
+export interface AuditRecord {
+  readonly seq: number;
+  readonly at: string;
+  /** Client name, `null` for unsigned calls (open mode or rejected without a known client). */
+  readonly client: string | null;
+  readonly method: string;
+  readonly ok: boolean;
+  /** Why the call was rejected or failed; `null` on success. */
+  readonly reason: string | null;
+  readonly jobId: string | null;
 }
 
 /** Whether a queued job may be leased by `pool` under a {@link LeaseQuery}. */
@@ -96,7 +112,17 @@ export class StaleLeaseError extends Error {
  * and must pass the same contract tests.
  */
 export interface Store {
-  insertJob(input: { id: JobId; spec: JobSpec; candidates: readonly string[] }): JobRecord;
+  insertJob(input: { id: JobId; spec: JobSpec; candidates: readonly string[]; client?: string | null }): JobRecord;
+  /** Queued, leased or running jobs submitted by `client`. */
+  countUnfinished(client: string): number;
+  /**
+   * Records a request nonce until `expiresAt` (epoch ms). Returns false when the
+   * nonce was already used by this client and has not expired. Prunes expired nonces.
+   */
+  useNonce(input: { client: string; nonce: string; expiresAt: number; now: number }): boolean;
+  appendAudit(input: { client: string | null; method: string; ok: boolean; reason: string | null; jobId: string | null }): AuditRecord;
+  /** Newest first. */
+  readAudit(input: { limit?: number; client?: string }): readonly AuditRecord[];
   getJob(id: JobId): JobRecord | null;
   /** Newest first. */
   listJobs(query: ListQuery): readonly JobRecord[];
@@ -151,7 +177,27 @@ export interface Store {
   close(): void;
 }
 
-export const SCHEMA_VERSION = 3;
+export const SCHEMA_VERSION = 4;
+
+const AUTH_SCHEMA = `
+CREATE TABLE IF NOT EXISTS nonces (
+  client TEXT NOT NULL,
+  nonce TEXT NOT NULL,
+  expires INTEGER NOT NULL,
+  PRIMARY KEY (client, nonce)
+);
+CREATE INDEX IF NOT EXISTS nonces_expires ON nonces (expires);
+CREATE TABLE IF NOT EXISTS audit (
+  seq INTEGER PRIMARY KEY AUTOINCREMENT,
+  at TEXT NOT NULL,
+  client TEXT,
+  method TEXT NOT NULL,
+  ok INTEGER NOT NULL,
+  reason TEXT,
+  job_id TEXT
+);
+CREATE INDEX IF NOT EXISTS jobs_client ON jobs (client, status);
+`;
 
 const POOL_STATE_SCHEMA = `
 CREATE TABLE IF NOT EXISTS pool_state (
@@ -180,7 +226,8 @@ CREATE TABLE IF NOT EXISTS jobs (
   started_at TEXT,
   finished_at TEXT,
   result TEXT,
-  runtime TEXT
+  runtime TEXT,
+  client TEXT
 );
 CREATE INDEX IF NOT EXISTS jobs_queue ON jobs (status, priority, created_at);
 CREATE INDEX IF NOT EXISTS jobs_lease ON jobs (lease_expires) WHERE lease_owner IS NOT NULL;
@@ -192,7 +239,7 @@ CREATE TABLE IF NOT EXISTS events (
   data TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS events_job ON events (job_id, seq);
-${POOL_STATE_SCHEMA}`;
+${POOL_STATE_SCHEMA}${AUTH_SCHEMA}`;
 
 /** Parses a JSON text column, then validates it with `schema`. */
 const json = <T extends z.ZodType>(schema: T) =>
@@ -223,6 +270,7 @@ const JobRowSchema = z.object({
   finished_at: z.string().nullable(),
   result: json(JobResultSchema).nullable(),
   runtime: json(z.unknown()).nullable(),
+  client: z.string().nullable(),
 });
 type JobRow = z.infer<typeof JobRowSchema>;
 
@@ -239,6 +287,16 @@ const CandidateRowSchema = z.object({ id: z.string(), candidates: json(z.array(z
 const SumRowSchema = z.object({ total: z.number().nullable() });
 const LaneCountRowSchema = z.object({ lane: z.string(), n: z.number() });
 const PauseRowSchema = z.object({ pool: z.string(), paused_until: z.number() });
+const CountRowSchema = z.object({ n: z.number() });
+const AuditRowSchema = z.object({
+  seq: z.number(),
+  at: z.string(),
+  client: z.string().nullable(),
+  method: z.string(),
+  ok: z.number(),
+  reason: z.string().nullable(),
+  job_id: z.string().nullable(),
+});
 const VersionRowSchema = z.object({ user_version: z.number() });
 
 const ACTIVE = `status IN ('leased', 'running')`;
@@ -247,6 +305,7 @@ function toRecord(row: JobRow): JobRecord {
   return {
     id: row.id,
     spec: row.spec,
+    client: row.client,
     status: row.status,
     phase: row.phase,
     candidates: row.candidates,
@@ -262,6 +321,10 @@ function toRecord(row: JobRow): JobRecord {
 
 function toLease(row: z.infer<typeof LeaseRowSchema>): Lease {
   return { jobId: row.id, owner: row.lease_owner ?? "", fence: row.fence, expiresAt: row.lease_expires ?? 0 };
+}
+
+function toAudit(row: z.infer<typeof AuditRowSchema>): AuditRecord {
+  return { seq: row.seq, at: row.at, client: row.client, method: row.method, ok: row.ok !== 0, reason: row.reason, jobId: row.job_id };
 }
 
 function toEvent(row: z.infer<typeof EventRowSchema>): StoredEvent {
@@ -295,6 +358,10 @@ function migrate(db: DatabaseSync): void {
       if (version === 0) db.exec(SQLITE_SCHEMA);
       if (version === 1) db.exec("ALTER TABLE jobs ADD COLUMN runtime TEXT");
       if (version >= 1 && version < 3) db.exec(POOL_STATE_SCHEMA);
+      if (version >= 1 && version < 4) {
+        db.exec("ALTER TABLE jobs ADD COLUMN client TEXT");
+        db.exec(AUTH_SCHEMA);
+      }
       db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
     });
   }
@@ -337,18 +404,47 @@ class SqliteStore implements Store {
     if (changed === 0) throw new StaleLeaseError(lease);
   }
 
-  insertJob(input: { id: JobId; spec: JobSpec; candidates: readonly string[] }): JobRecord {
+  insertJob(input: { id: JobId; spec: JobSpec; candidates: readonly string[]; client?: string | null }): JobRecord {
     this.run(
-      `INSERT INTO jobs (id, spec, status, candidates, priority, created_at) VALUES (?, ?, 'queued', ?, ?, ?)`,
+      `INSERT INTO jobs (id, spec, status, candidates, priority, created_at, client) VALUES (?, ?, 'queued', ?, ?, ?, ?)`,
       input.id,
       JSON.stringify(input.spec),
       JSON.stringify(input.candidates),
       input.spec.priority,
       iso(),
+      input.client ?? null,
     );
     const row = this.job(input.id);
     if (!row) throw new Error(`insert of ${input.id} did not persist`);
     return toRecord(row);
+  }
+
+  countUnfinished(client: string): number {
+    const row = this.db.prepare(`SELECT COUNT(*) AS n FROM jobs WHERE client = ? AND status IN ('queued', 'leased', 'running')`).get(client);
+    return CountRowSchema.parse(row).n;
+  }
+
+  useNonce(input: { client: string; nonce: string; expiresAt: number; now: number }): boolean {
+    return tx(this.db, () => {
+      this.run("DELETE FROM nonces WHERE expires < ?", input.now);
+      return this.run("INSERT OR IGNORE INTO nonces (client, nonce, expires) VALUES (?, ?, ?)", input.client, input.nonce, input.expiresAt) === 1;
+    });
+  }
+
+  appendAudit(input: { client: string | null; method: string; ok: boolean; reason: string | null; jobId: string | null }): AuditRecord {
+    const row = this.db
+      .prepare(`INSERT INTO audit (at, client, method, ok, reason, job_id) VALUES (?, ?, ?, ?, ?, ?) RETURNING *`)
+      .get(iso(), input.client, input.method, input.ok ? 1 : 0, input.reason, input.jobId);
+    return toAudit(AuditRowSchema.parse(row));
+  }
+
+  readAudit(input: { limit?: number; client?: string }): readonly AuditRecord[] {
+    const limit = Math.max(1, Math.trunc(input.limit ?? 100));
+    const rows =
+      input.client === undefined
+        ? this.db.prepare(`SELECT * FROM audit ORDER BY seq DESC LIMIT ?`).all(limit)
+        : this.db.prepare(`SELECT * FROM audit WHERE client = ? ORDER BY seq DESC LIMIT ?`).all(input.client, limit);
+    return rows.map((row) => toAudit(AuditRowSchema.parse(row)));
   }
 
   getJob(id: JobId): JobRecord | null {
@@ -366,6 +462,10 @@ class SqliteStore implements Store {
     if (query.requester !== undefined) {
       where.push(`json_extract(spec, '$.requester') = ?`);
       params.push(query.requester);
+    }
+    if (query.client !== undefined) {
+      where.push(`client = ?`);
+      params.push(query.client);
     }
     const sql =
       `SELECT * FROM jobs ${where.length ? `WHERE ${where.join(" AND ")}` : ""} ` +

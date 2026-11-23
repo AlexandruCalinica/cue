@@ -1,5 +1,6 @@
 export * from "./job.js";
 export * from "./config.js";
+export * from "./auth.js";
 
 /** Thrown by scaffold stubs that later milestones fill in. */
 export class NotImplementedError extends Error {

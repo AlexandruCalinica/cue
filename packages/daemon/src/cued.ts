@@ -13,6 +13,9 @@ async function main(): Promise<void> {
   const cued = await startCued({ config, adapters: [claudeAdapter, codexAdapter] });
   const { port, bindAddress } = config.node;
   process.stderr.write(`cued: node ${cued.nodeId} up; clients use CUE_SEEDS=${config.node.advertiseAddress ?? bindAddress}:${port + 2}\n`);
+  if (Object.keys(config.clients).length === 0) {
+    process.stderr.write("cued: warning: no clients configured, so anyone with CUE_COOKIE can call every verb (see `clients` in cue.yaml)\n");
+  }
 
   let stopping = false;
   const stop = (signal: string) => {

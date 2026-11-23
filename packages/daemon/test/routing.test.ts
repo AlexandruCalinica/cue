@@ -99,6 +99,13 @@ describe("routing, pauses, budgets and lanes (fake harness)", () => {
     expect((await gw().events({ id })).map((e) => e.type)).toContain("requeued");
     expect((await stats()).paused["claude:a"]).toBeGreaterThan(Date.now());
 
+    // A job pinned to the paused pool says why it waits.
+    const pinned = await submit("say pinned", { harness: "claude:a" });
+    const waiting = (await status(pinned)).waiting ?? [];
+    expect(waiting).toHaveLength(1);
+    expect(waiting[0]).toMatchObject({ kind: "pool", pool: "claude:a", blocker: "paused" });
+    await gw().cancel(pinned);
+
     await cued?.shutdown();
     cued = null;
     await start(over);
@@ -137,9 +144,11 @@ describe("routing, pauses, budgets and lanes (fake harness)", () => {
     const held = await submit("say held", { lane: "frozen" });
     await runningOn(one);
     await runningOn(free);
-    expect((await status(two)).status).toBe("queued");
+    expect(await status(two)).toMatchObject({ status: "queued", waiting: expect.arrayContaining([{ kind: "lane", lane: "team", blocker: "full" }]) });
     expect((await stats()).lanes["team"]).toEqual({ active: 1, concurrency: 1, enabled: true });
     expect((await settle(two)).status).toBe("succeeded");
-    expect((await status(held)).status).toBe("queued");
+    expect(await status(held)).toMatchObject({ status: "queued", waiting: expect.arrayContaining([{ kind: "lane", lane: "frozen", blocker: "disabled" }]) });
+    // Terminal and running jobs carry no wait reasons.
+    expect((await status(two)).waiting).toBeUndefined();
   });
 });

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { isTerminal, newJobId, parseConfig, poolKey, JobSpecSchema } from "@cue/core";
+import { generateClientKey, isTerminal, newJobId, parseConfig, poolKey, JobSpecSchema } from "@cue/core";
 
 describe("core", () => {
   it("parses a minimal cue.yaml with defaults", () => {
@@ -11,6 +11,19 @@ describe("core", () => {
 
   it("rejects duplicate pools", () => {
     expect(() => parseConfig({ pools: [{ harness: "claude" }, { harness: "claude" }] })).toThrow(/duplicate pool/);
+  });
+
+  it("validates clients", () => {
+    const a = generateClientKey().publicKey;
+    const b = generateClientKey().publicKey;
+    const pools = [{ harness: "claude" }];
+    const ok = parseConfig({ pools, clients: { alice: { publicKey: a } } });
+    expect(ok.clients["alice"]).toMatchObject({ scope: "own", verbs: ["submit", "status", "list", "cancel", "logs", "events"] });
+    expect(ok.safety.onDenial).toBe("flag");
+    expect(() => parseConfig({ pools, clients: { alice: { publicKey: "nope" } } })).toThrow(/client alice: public key/);
+    expect(() => parseConfig({ pools, clients: { alice: { publicKey: a }, bob: { publicKey: a } } })).toThrow(/share a public key/);
+    expect(() => parseConfig({ pools, clients: { alice: { publicKey: b, lanes: ["x"], defaultLane: "y" } } })).toThrow(/defaultLane y/);
+    expect(() => parseConfig({ pools, clients: { alice: { publicKey: b, verbs: ["delete"] } } })).toThrow();
   });
 
   it("validates job specs and ids", () => {
